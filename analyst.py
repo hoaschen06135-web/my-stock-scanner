@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import time
 import plotly.graph_objects as go
 
-# --- 1. 初始化環境與記憶體 ---
+# --- 1. 初始化與記憶體 ---
 st.set_page_config(layout="wide", page_title="專業關注清單監控")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
@@ -26,10 +26,9 @@ def calculate_kdj(df):
         return df
     except: return None
 
-# --- 3. 數據同步核心 (回歸 Yahoo 換手率) ---
+# --- 3. 數據同步核心 (修復換手率 0.00% 問題) ---
 def sync_all_data(watchlist):
     dl = DataLoader()
-    # 嘗試登入 (處理 AttributeError 保護)
     try:
         if hasattr(dl, 'login'): dl.login(token=TOKEN)
     except: pass
@@ -38,20 +37,24 @@ def sync_all_data(watchlist):
         sid = str(row['股票代號']).split('.')[0].strip()
         sid_tw = f"{sid}.TW"
         sname = row['名稱']
-        report = {"name": sname, "market": None, "chips": None, "err_y": None, "err_f": None, "hist": None}
+        report = {"name": sname, "market": None, "chips": None, "err_y": None, "hist": None}
         
-        # Yahoo 引擎：負責 漲幅、量比、換手率、KD
+        # Yahoo 引擎：負責 漲幅、量比、換手率
         try:
+            # 依照報錯建議，不設定自定義 session，讓 yfinance 自行處理
             tk = yf.Ticker(sid_tw)
             hist = tk.history(period='3mo')
             
             if hist.empty:
-                report["err_y"] = "Yahoo 限流 (Rate Limited)"
+                report["err_y"] = "Yahoo 目前限流 (Rate Limited)"
             else:
-                # 抓取總股數 (處理 AttributeError 修復)
-                # 優先嘗試 tk.info，若失敗則給予 0
+                # 增加 1.5 秒延遲，提高抓取總股數的成功率
+                time.sleep(1.5)
+                
+                # 換手率核心修正：嘗試多個股數屬性
                 try:
-                    shares = tk.info.get('sharesOutstanding', 0)
+                    info_data = tk.info
+                    shares = info_data.get('sharesOutstanding') or info_data.get('floatShares') or 0
                 except:
                     shares = 0
                 
@@ -59,8 +62,7 @@ def sync_all_data(watchlist):
                 chg = ((last_p - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
                 v_ratio = hist['Volume'].iloc[-1] / hist['Volume'].iloc[-6:-1].mean()
                 
-                # 計算換手率
-                # $$\text{Turnover Rate} = \frac{\text{Volume}}{\text{Shares Outstanding}} \times 100\%$$
+                # 換手率公式：成交量 / 總股數
                 turnover = (hist['Volume'].iloc[-1] / shares) * 100 if shares > 0 else 0
                 
                 report["market"] = {"price": last_p, "change": chg, "v_ratio": v_ratio, "turnover": turnover}
@@ -88,42 +90,25 @@ def sync_all_data(watchlist):
         
         st.session_state.stock_memory[sid] = report
 
-# --- 4. 側邊欄控制 ---
+# --- 4. 側邊欄與主畫面呈現 ---
 with st.sidebar:
     st.header("⚙️ 控制面板")
     if st.button("🔄 同步雲端清單", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    with st.expander("➕ 新增股票"):
-        with st.form("add_form", clear_on_submit=True):
-            add_sid = st.text_input("股票代號")
-            if st.form_submit_button("確認加入"):
-                if add_sid:
-                    try:
-                        tk = yf.Ticker(f"{add_sid}.TW")
-                        name = tk.info.get('shortName') or f"股票 {add_sid}"
-                        df_old = conn.read(ttl=0).dropna(how='all')
-                        df_new = pd.DataFrame([[str(add_sid), name]], columns=df_old.columns[:2])
-                        conn.update(data=pd.concat([df_old, df_new], ignore_index=True))
-                        st.cache_data.clear(); st.success(f"已加入 {name}"); time.sleep(1); st.rerun()
-                    except: st.error("寫入失敗")
-
-    try:
-        raw = conn.read(ttl=600).dropna(how='all')
-        watchlist = raw.iloc[:, :2].copy()
-        watchlist.columns = ["股票代號", "名稱"]
-    except: st.stop()
+    raw = conn.read(ttl=600).dropna(how='all')
+    watchlist = raw.iloc[:, :2].copy()
+    watchlist.columns = ["股票代號", "名稱"]
 
     if st.button("🚀 一鍵同步所有數據指標", use_container_width=True):
-        with st.spinner("同步中..."):
+        with st.spinner("同步數據中，請稍候..."):
             sync_all_data(watchlist)
             st.rerun()
 
     if st.button("🧹 清除畫面數據", use_container_width=True):
         st.session_state.stock_memory = {}; st.rerun()
 
-# --- 5. 主畫面呈現 (三指標版) ---
 st.title("🚀 專業關注清單監控")
 
 for _, row in watchlist.iterrows():
@@ -148,6 +133,7 @@ for _, row in watchlist.iterrows():
                 m = d["market"]; c1, c2, c3 = st.columns(3)
                 c1.metric("現價/漲幅", f"{m['price']}", f"{m['change']:.2f}%")
                 c2.metric("量比", f"{m['v_ratio']:.2f}")
+                # 若換手率仍為 0.00%，會在下方顯示數據異常提示
                 c3.metric("換手率", f"{m['turnover']:.2f}%")
             
             if d["chips"]:
