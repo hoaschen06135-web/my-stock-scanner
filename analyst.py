@@ -6,28 +6,28 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 import time
 
-# 1. 初始化環境
-st.set_page_config(layout="wide", page_title="旗艦監控站-雙按鈕版")
+# 1. 初始化與環境設定
+st.set_page_config(layout="wide", page_title="雙核心監控站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
-# 2. Yahoo 數據抓取 (解決行情與換手率問題)
+# 2. Yahoo 數據抓取 (行情與換手率 - 不限額度)
 @st.cache_data(ttl=600)
-def get_yahoo_data(sid_tw):
+def get_yahoo_info(sid_tw):
     try:
         ticker = yf.Ticker(sid_tw)
-        hist = ticker.history(period='1mo')
+        hist = ticker.history(period='5d')
         shares = ticker.info.get('sharesOutstanding', 0)
         return hist, shares
     except:
         return pd.DataFrame(), 0
 
-# 3. FinMind 籌碼抓取 (獨立按鈕控制)
+# 3. FinMind 籌碼抓取 (法人張數 - 消耗額度)
 def get_fm_chips(sid):
     dl = DataLoader()
     try:
         dl.login(token=TOKEN)
-        time.sleep(1) # 保護延遲
+        time.sleep(1) # 保護延遲，防止 503 錯誤
         df = dl.taiwan_stock_institutional_investors(
             stock_id=sid, 
             start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
@@ -36,17 +36,18 @@ def get_fm_chips(sid):
     except:
         return pd.DataFrame()
 
-# 4. 主介面
-st.title("🚀 專業關注清單 (雙來源按鈕控制)")
+# 4. 主介面邏輯
+st.title("🚀 專業關注清單 (雙核心控制版)")
 
 try:
     raw = conn.read().dropna(how='all')
     watchlist = raw.iloc[:, :2].copy()
     watchlist.columns = ["股票代號", "名稱"]
 except:
-    st.info("清單為空，請從左側新增。")
+    st.info("清單為空。")
     st.stop()
 
+# 遍歷每支股票
 for _, row in watchlist.iterrows():
     sid_full = str(row['股票代號']).strip()
     sid = sid_full.split('.')[0]
@@ -54,30 +55,34 @@ for _, row in watchlist.iterrows():
     sname = str(row['名稱']).strip()
     
     with st.container(border=True):
-        st.markdown(f"### **{sname}** `{sid_tw}`")
+        st.subheader(f"{sname} ({sid_tw})")
         
-        # UI 第一層：行情 (Yahoo 來源)
-        col_y, col_fm = st.columns([1, 1])
+        # 建立兩個按鈕的欄位
+        col_btn1, col_btn2 = st.columns(2)
         
-        with col_y:
-            if st.button(f"🔍 檢查行情與換手 ({sid})", key=f"y_{sid}"):
-                hist, shares = get_yahoo_data(sid_tw)
-                if not hist.empty:
-                    last_p = round(hist['Close'].iloc[-1], 2)
-                    chg = ((last_p - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
-                    vol = hist['Volume'].iloc[-1]
-                    # 換手率計算：$$Turnover\ Rate = \frac{Volume}{Total\ Shares} \times 100\%$$
-                    turnover = (vol / shares) * 100 if shares > 0 else 0
-                    
-                    color = "red" if chg > 0 else "green"
-                    st.write(f"價: **{last_p}** | 幅: <span style='color:{color}'>{chg:.2f}%</span>", unsafe_allow_html=True)
-                    st.write(f"換手率: **{turnover:.2f}%** (分母: Yahoo 提供)")
-                else:
-                    st.error("Yahoo 行情獲取失敗")
+        # 按鈕一：Yahoo 行情
+        with col_btn1:
+            if st.button(f"🔍 檢查行情與換手率", key=f"y_btn_{sid}"):
+                with st.spinner("Yahoo 數據加載中..."):
+                    hist, shares = get_yahoo_info(sid_tw)
+                    if not hist.empty:
+                        last_p = round(hist['Close'].iloc[-1], 2)
+                        prev_p = hist['Close'].iloc[-2]
+                        chg = ((last_p - prev_p) / prev_p) * 100
+                        vol = hist['Volume'].iloc[-1]
+                        # 換手率計算 (股數分母由 Yahoo 提供)
+                        turnover = (vol / shares) * 100 if shares > 0 else 0
+                        
+                        color = "red" if chg > 0 else "green"
+                        st.success(f"現價: {last_p} | 漲幅: {chg:.2f}%")
+                        st.info(f"今日換手率: {turnover:.2f}%")
+                    else:
+                        st.error("無法取得 Yahoo 行情")
 
-        with col_fm:
-            if st.button(f"📊 讀取法人籌碼 ({sid})", key=f"fm_{sid}"):
-                with st.spinner("FinMind 數據加載中..."):
+        # 按鈕二：FinMind 法人籌碼
+        with col_btn2:
+            if st.button(f"📊 讀取三大法人張數", key=f"fm_btn_{sid}"):
+                with st.spinner("FinMind 籌碼計算中..."):
                     chips = get_fm_chips(sid)
                     if not chips.empty:
                         last_d = chips['date'].max()
@@ -94,7 +99,7 @@ for _, row in watchlist.iterrows():
                                 results.append(f"{label}:<span style='color:{c}'>{n}張</span>")
                         
                         t_c = "red" if total_net > 0 else "green"
-                        st.write(f"🗓️ {last_d} | 合計: <span style='color:{t_c}'>{total_net}張</span>", unsafe_allow_html=True)
+                        st.markdown(f"🗓️ **{last_d}** | 合計: <span style='color:{t_c}'>{total_net}張</span>", unsafe_allow_html=True)
                         st.markdown(f"<small>{' | '.join(results)}</small>", unsafe_allow_html=True)
                     else:
-                        st.warning("籌碼額度已滿或頻率過快，請稍後再試")
+                        st.warning("API 額度已滿或頻率過快")
