@@ -5,7 +5,7 @@ from streamlit_gsheets import GSheetsConnection
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 
-# --- 1. 初始化與環境設定 ---
+# --- 1. 初始化環境 ---
 st.set_page_config(layout="wide", page_title="專業行動分析站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
@@ -13,14 +13,14 @@ TOKEN = st.secrets["FINMIND_TOKEN"]
 # --- 2. 核心計算函數 ---
 def calculate_metrics(df, total_shares):
     """計算漲幅、量比與換手率"""
-    vol_col = 'Trading_Volume' # FinMind 標準成交量欄位
+    vol_col = 'Trading_Volume' # FinMind 正確成交量欄位
     if vol_col not in df.columns or len(df) < 5: return None
     
     close_t = df['close'].iloc[-1]
     close_y = df['close'].iloc[-2]
     change_pct = ((close_t - close_y) / close_y) * 100
     
-    # 量比：今日量 / 前5日平均量
+    # 量比：今日成交量 / 前5日平均量 (排除今日)
     avg_vol_5d = df[vol_col].iloc[-6:-1].mean()
     vol_ratio = df[vol_col].iloc[-1] / avg_vol_5d if avg_vol_5d > 0 else 0
     
@@ -56,10 +56,10 @@ def show_kd_dialog(stock_id, name):
         fig.update_layout(height=350, margin=dict(l=0,r=0,t=10,b=0), yaxis=dict(range=[0,100]))
         st.plotly_chart(fig, use_container_width=True)
 
-# --- 3. 側邊欄：控制與新增 ---
+# --- 3. 側邊欄控制面板 ---
 st.sidebar.title("⚙️ 控制面板")
 
-# 手動更新按鈕
+# 更新按鈕
 if st.sidebar.button("🔄 立即重新整理數據"):
     st.cache_data.clear()
     st.rerun()
@@ -71,7 +71,10 @@ new_sid = st.sidebar.text_input("輸入代號 (如: 2330)")
 dl = DataLoader()
 try: dl.login(token=TOKEN)
 except: pass
+
+# 核心修正：將發行股數與代號對齊
 stock_info = dl.taiwan_stock_info()
+stock_info['stock_id'] = stock_info['stock_id'].astype(str) # 關鍵：轉為字串以匹配
 
 if st.sidebar.button("確認新增"):
     if new_sid:
@@ -113,17 +116,14 @@ for _, row in watchlist.iterrows():
         col_main, col_btn = st.columns([8, 2])
         with col_main:
             st.markdown(f"**{sname}** `{sid_full}`")
-            
-            # 抓取日數據 (計算漲幅、量比、換手)
             df_daily = dl.taiwan_stock_daily(stock_id=sid, start_date=(datetime.now()-timedelta(15)).strftime('%Y-%m-%d'))
             
             if df_daily is not None and not df_daily.empty:
                 # 獲取總發行股數 (換手率關鍵)
                 t_info = stock_info[stock_info['stock_id'] == sid]
-                # 相容不同版本的欄位名稱
                 total_shares = 0
                 for col in ['public_shares', 'issued_shares', 'shares']:
-                    if col in t_info.columns:
+                    if col in t_info.columns and not t_info.empty:
                         total_shares = t_info[col].values[0]
                         break
                 
@@ -134,37 +134,22 @@ for _, row in watchlist.iterrows():
                     c1.markdown(f"價: **{m['price']}**")
                     c2.markdown(f"幅: <span style='color:{color}'>{m['change']:.2f}%</span>", unsafe_allow_html=True)
                     c3.markdown(f"量比: **{m['vol_ratio']:.1f}**")
-                    c4.markdown(f"換手: **{m['turnover']:.1f}%**")
+                    c4.markdown(f"換手: **{m['turnover']:.1f}%**") # 這裡會顯示正確換手率
                 
-                # --- 法人籌碼顯示 (優化邏輯) ---
-                inst_df = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=(datetime.now()-timedelta(20)).strftime('%Y-%m-%d'))
+                # 法人籌碼顯示
+                inst_df = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d'))
                 if inst_df is not None and not inst_df.empty:
-                    # 強制轉數值
-                    inst_df['buy'] = pd.to_numeric(inst_df['buy'], errors='coerce')
-                    inst_df['sell'] = pd.to_numeric(inst_df['sell'], errors='coerce')
-                    inst_df['net'] = inst_df['buy'] - inst_df['sell']
-                    
-                    # 尋找有實際交易數據的最新日期
-                    valid_dates = inst_df.groupby('date')['net'].apply(lambda x: x.abs().sum()).reset_index()
-                    latest_d = valid_dates[valid_dates['net'] > 0]['date'].max()
-                    
-                    if pd.notna(latest_d):
-                        today_inst = inst_df[inst_df['date'] == latest_d]
-                        mapping = {"外資": ["外資", "陸資"], "投信": ["投信"], "自營": ["自營"]}
-                        chips = []
-                        total_net = 0
-                        for label, kw in mapping.items():
-                            r = today_inst[today_inst['name'].str.contains('|'.join(kw), na=False)]
-                            if not r.empty:
-                                n = int(r['net'].sum() // 1000)
-                                total_net += n
-                                c = "red" if n > 0 else "green"
-                                chips.append(f"{label}:<span style='color:{c}'>{n}張</span>")
-                        
-                        t_color = "red" if total_net > 0 else "green" if total_net < 0 else "gray"
-                        # 完整顯示張數數據
-                        st.markdown(f"🗓️ {latest_d} | 合計: <span style='color:{t_color}'>{total_net}張</span>", unsafe_allow_html=True)
-                        st.markdown(f"<small>{' | '.join(chips)}</small>", unsafe_allow_html=True)
+                    last_d = inst_df['date'].max()
+                    today_inst = inst_df[inst_df['date'] == last_d]
+                    mapping = {"外資": ["外資", "陸資"], "投信": ["投信"], "自營": ["自營"]}
+                    chips = []
+                    for label, kw in mapping.items():
+                        r = today_inst[today_inst['name'].str.contains('|'.join(kw), na=False)]
+                        if not r.empty:
+                            n = int((r['buy'].sum() - r['sell'].sum()) // 1000)
+                            c = "red" if n > 0 else "green"
+                            chips.append(f"{label}:<span style='color:{c}'>{n}張</span>")
+                    st.markdown(f"<small>🗓️ {last_d} | {' '.join(chips)}</small>", unsafe_allow_html=True)
             
         with col_btn:
             if st.button("📈", key=f"btn_{sid}"):
