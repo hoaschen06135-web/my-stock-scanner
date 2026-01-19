@@ -6,4 +6,4 @@ lxml
 urllib3
 plotly
 FinMind
-streamlit-gsheets
+st-gsheets-connection
