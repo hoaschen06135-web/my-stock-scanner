@@ -7,42 +7,42 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 import time
 
-# --- 1. 初始化與環境設定 ---
+# 1. 初始化與環境設定
 st.set_page_config(layout="wide", page_title="旗艦監控站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
-# --- 2. yfinance 數據抓取 (避開 FinMind 額度限制並修復換手率) ---
+# 2. yfinance 資料抓取 (穩定性高，提供總股數解決換手率問題)
 @st.cache_data(ttl=3600)
 def fetch_yfinance_data(sid_tw):
     try:
         ticker = yf.Ticker(sid_tw)
         hist = ticker.history(period="1mo")
         info = ticker.info
-        # 直接從 Yahoo 取得總股數，解決換手率 0.0% 問題
+        # 直接從 Yahoo 取得總股數
         shares = info.get('sharesOutstanding', 0)
         return hist, shares
-    except Exception:
+    except:
         return pd.DataFrame(), 0
 
-# --- 3. FinMind 籌碼抓取 (加入 503 錯誤保護) ---
+# 3. FinMind 籌碼抓取 (加入限流保護，防止 503 攔截)
 @st.cache_data(ttl=1800)
 def fetch_fm_chips(sid):
     dl = DataLoader()
     try:
         dl.login(token=TOKEN)
-        # 增加延遲，減少未驗證帳號被攔截的機率
-        time.sleep(1.2)
+        # 每支股票間隔 1.5 秒，適應 300 次的低限額帳號
+        time.sleep(1.5)
         df = dl.taiwan_stock_institutional_investors(
             stock_id=sid, 
             start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
         )
         return df if (df is not None and not df.empty) else pd.DataFrame()
-    except Exception:
+    except:
         return pd.DataFrame()
 
-# --- 4. 主介面顯示 ---
-st.title("🚀 專業關注清單 (雙核心版)")
+# 4. 主介面顯示
+st.title("🚀 專業關注清單 (FinMind + Yahoo)")
 
 if st.sidebar.button("🔄 強制刷新數據"):
     st.cache_data.clear()
@@ -52,11 +52,11 @@ try:
     raw = conn.read().dropna(how='all')
     watchlist = raw.iloc[:, :2].copy()
     watchlist.columns = ["股票代號", "名稱"]
-except Exception:
+except:
+    st.info("清單為空，請從左側新增。")
     st.stop()
 
 for _, row in watchlist.iterrows():
-    # 代號自動處理
     sid_full = str(row['股票代號']).strip()
     sid = sid_full.split('.')[0]
     sid_tw = f"{sid}.TW"
@@ -83,15 +83,15 @@ for _, row in watchlist.iterrows():
                 color = "red" if change_pct > 0 else "green"
                 c1.markdown(f"價: **{last_price}**")
                 c2.markdown(f"幅: <span style='color:{color}'>{change_pct:.2f}%</span>", unsafe_allow_html=True)
-                c3.markdown(f"來源: `Yahoo Finance`")
+                c3.markdown(f"量比: `Yahoo`")
                 c4.markdown(f"換手: **{turnover:.2f}%**")
                 
-                # 使用 FinMind 抓取籌碼
+                # 使用 FinMind 抓取法人張數
                 inst_df = fetch_fm_chips(sid)
                 if not inst_df.empty:
                     last_d = inst_df['date'].max()
                     today = inst_df[inst_df['date'] == last_d]
-                    # 鎖定診斷截圖顯示的英文標籤
+                    # 使用英文標籤匹配診斷資料
                     map_inst = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
                     chips = []
                     total_net = 0
@@ -106,6 +106,6 @@ for _, row in watchlist.iterrows():
                     t_color = "red" if total_net > 0 else "green" if total_net < 0 else "gray"
                     st.markdown(f"<small>🗓️ {last_d} | 合計: <span style='color:{t_color}'>{total_net}張</span> | {' '.join(chips)}</small>", unsafe_allow_html=True)
                 else:
-                    st.caption("⚠️ 籌碼資料獲取中或頻率過快，請稍後...")
+                    st.caption("⚠️ 籌碼資料獲取中或頻率過快...")
             else:
                 st.warning(f"無法取得 {sid_tw} 的數據。")
