@@ -5,7 +5,7 @@ from streamlit_gsheets import GSheetsConnection
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 
-# --- 1. 環境設定 ---
+# --- 1. 初始化與環境設定 ---
 st.set_page_config(layout="wide", page_title="行動分析站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
@@ -43,6 +43,8 @@ def show_kd_dialog(stock_id, name):
             fig.add_trace(go.Scatter(x=df['date'], y=df['D'], name='D 線', line=dict(color='orange')))
             fig.update_layout(yaxis=dict(range=[0, 100]), height=400, margin=dict(l=0,r=0,t=20,b=0))
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.error("無法取得歷史數據。")
 
 # --- 4. 主介面 ---
 st.title("⭐ 雲端關注清單監控")
@@ -71,41 +73,48 @@ for _, row in watchlist.iterrows():
     
     with c2:
         try:
-            # 擴大範圍至 30 天，確保能抓到歷史籌碼
+            # 抓取最近 30 天數據確保有內容
             start_c = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
             inst_df = dl.taiwan_stock_institutional_investors(stock_id=pure_id, start_date=start_c)
             
             if inst_df is not None and not inst_df.empty:
-                # 只取最後一個有資料的交易日
-                latest_date = inst_df['date'].max()
+                # 排除數據全是 0 的日期，尋找最後一個有實際交易量的日子
+                inst_df['net_buy'] = pd.to_numeric(inst_df['buy'], errors='coerce') - pd.to_numeric(inst_df['sell'], errors='coerce')
+                valid_days = inst_df.groupby('date')['net_buy'].apply(lambda x: x.abs().sum()).reset_index()
+                latest_date = valid_days[valid_days['net_buy'] > 0]['date'].max()
+                
+                if pd.isna(latest_date): latest_date = inst_df['date'].max()
+                
                 today_data = inst_df[inst_df['date'] == latest_date].copy()
                 
-                # 強制轉換為數值格式，避免計算出錯
-                today_data['buy'] = pd.to_numeric(today_data['buy'], errors='coerce')
-                today_data['sell'] = pd.to_numeric(today_data['sell'], errors='coerce')
+                # 法人名稱匹配清單
+                mapping = {
+                    "外資": ["外資", "陸資", "Foreign"],
+                    "投信": ["投信", "Investment"],
+                    "自營": ["自營", "Dealer"]
+                }
                 
-                mapping = {"外資": ["外資", "陸資"], "投信": ["投信"], "自營": ["自營"]}
                 chips_list = []
                 total_net = 0
                 
                 for label, keywords in mapping.items():
-                    # 模糊比對法人名稱
-                    mask = today_data['name'].str.contains('|'.join(keywords), na=False)
+                    mask = today_data['name'].str.contains('|'.join(keywords), na=False, case=False)
                     r = today_data[mask]
                     if not r.empty:
-                        # 換算為張數並加總
-                        net_lots = int((r['buy'].sum() - r['sell'].sum()) // 1000)
+                        # 換算張數：(買進 - 賣出) // 1000
+                        net_shares = r['buy'].astype(float).sum() - r['sell'].astype(float).sum()
+                        net_lots = int(net_shares // 1000)
                         total_net += net_lots
                         color = "red" if net_lots > 0 else "green" if net_lots < 0 else "gray"
                         chips_list.append(f"{label}: <span style='color:{color}'>{net_lots}張</span>")
                 
                 total_color = "red" if total_net > 0 else "green" if total_net < 0 else "gray"
-                st.markdown(f"🗓️ {latest_date} | 合計: <span style='color:{total_color}'>{total_net}張</span>", unsafe_allow_html=True)
+                st.markdown(f"🗓️ {latest_date} | **合計: <span style='color:{total_color}'>{total_net}張</span>**", unsafe_allow_html=True)
                 st.markdown(f"<small>{' | '.join(chips_list)}</small>", unsafe_allow_html=True)
             else:
                 st.caption("尚未公布最新法人數據")
-        except:
-            st.caption("數據解析中...")
+        except Exception as e:
+            st.caption(f"數據解析中...")
 
     if c3.button("📈 分析", key=f"btn_{pure_id}"):
         show_kd_dialog(sid, sname)
