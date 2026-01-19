@@ -6,104 +6,111 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 import time
 
-# 1. 初始化與環境設定
-st.set_page_config(layout="wide", page_title="旗艦監控站-終極穩定版")
+# --- 1. 初始化環境與 Session State ---
+st.set_page_config(layout="wide", page_title="旗艦數據分析站-常駐版")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
-# 2. Yahoo 數據抓取：移除 Session 以解決環境衝突
-@st.cache_data(ttl=600)
-def fetch_market_data(sid_tw):
-    try:
-        # 不使用自定義 Session，讓 yfinance 自行處理連線
-        ticker = yf.Ticker(sid_tw)
-        hist = ticker.history(period='5d')
-        # 獲取總股數以解決換手率 0% 問題
+# 初始化記憶體，確保數據不會消失
+if 'market_results' not in st.session_state:
+    st.session_state.market_results = {}
+if 'chip_results' not in st.session_state:
+    st.session_state.chip_results = {}
+
+# --- 2. 數據抓取函數 ---
+def fetch_all_market(watchlist):
+    """批次抓取 Yahoo 行情與換手率"""
+    for _, row in watchlist.iterrows():
+        sid = str(row['股票代號']).split('.')[0].strip()
+        sid_tw = f"{sid}.TW"
         try:
+            ticker = yf.Ticker(sid_tw)
+            hist = ticker.history(period='5d')
             shares = ticker.fast_info.shares_outstanding
+            if not hist.empty:
+                last_p = round(hist['Close'].iloc[-1], 2)
+                chg = ((last_p - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
+                vol = hist['Volume'].iloc[-1]
+                # 換手率公式：$$Turnover = \frac{Volume}{Total\ Shares} \times 100\%$$
+                turnover = (vol / shares) * 100 if shares > 0 else 0
+                st.session_state.market_results[sid] = {
+                    "price": last_p, "change": chg, "turnover": turnover
+                }
         except:
-            shares = ticker.info.get('sharesOutstanding', 0)
-            
-        if not hist.empty:
-            return hist, shares, None
-        return pd.DataFrame(), 0, "暫無行情數據"
-    except Exception as e:
-        return pd.DataFrame(), 0, str(e)
+            continue
 
-# 3. FinMind 籌碼抓取 (認證保護版)
-def fetch_chips(sid):
+def fetch_all_chips(watchlist):
+    """批次抓取 FinMind 籌碼數據"""
     dl = DataLoader()
-    try:
-        dl.login(token=TOKEN)
-        time.sleep(0.5) 
-        df = dl.taiwan_stock_institutional_investors(
-            stock_id=sid, 
-            start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
-        )
-        return df if (df is not None and not df.empty) else pd.DataFrame()
-    except:
-        return pd.DataFrame()
+    dl.login(token=TOKEN)
+    for _, row in watchlist.iterrows():
+        sid = str(row['股票代號']).split('.')[0].strip()
+        try:
+            time.sleep(0.5) # 認證帳號後的安全延遲
+            df = dl.taiwan_stock_institutional_investors(
+                stock_id=sid, 
+                start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
+            )
+            if df is not None and not df.empty:
+                last_d = df['date'].max()
+                today = df[df['date'] == last_d]
+                mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
+                res = {"date": last_d, "total": 0, "details": []}
+                for label, kw in mapping.items():
+                    r = today[today['name'].isin(kw)]
+                    if not r.empty:
+                        n = int((pd.to_numeric(r['buy']).sum() - pd.to_numeric(r['sell']).sum()) // 1000)
+                        res["total"] += n
+                        res["details"].append(f"{label}: {n}張")
+                st.session_state.chip_results[sid] = res
+        except:
+            continue
 
-# 4. 主介面顯示
-st.title("🚀 專業關注清單 (系統修復版)")
-
-try:
+# --- 3. 側邊欄控制面板 ---
+with st.sidebar:
+    st.title("⚙️ 控制面板")
     raw = conn.read().dropna(how='all')
     watchlist = raw.iloc[:, :2].copy()
     watchlist.columns = ["股票代號", "名稱"]
-except:
-    st.error("請確認 Google Sheets 連線。")
-    st.stop()
+    
+    st.subheader("批次更新數據")
+    if st.button("🔄 更新所有行情 (Yahoo)", use_container_width=True):
+        with st.spinner("行情抓取中..."):
+            fetch_all_market(watchlist)
+            st.rerun()
+            
+    if st.button("📊 更新所有籌碼 (FinMind)", use_container_width=True):
+        with st.spinner("籌碼分析中..."):
+            fetch_all_chips(watchlist)
+            st.rerun()
+
+    if st.button("🧹 清除快取記憶", use_container_width=True):
+        st.session_state.market_results = {}
+        st.session_state.chip_results = {}
+        st.rerun()
+
+# --- 4. 主畫面顯示 ---
+st.title("🚀 專業關注清單監控 (數據常駐版)")
 
 for _, row in watchlist.iterrows():
-    sid_full = str(row['股票代號']).strip()
-    sid = sid_full.split('.')[0]
-    sid_tw = f"{sid}.TW"
-    sname = str(row['名稱']).strip()
+    sid = str(row['股票代號']).split('.')[0].strip()
+    sname = row['名稱']
     
     with st.container(border=True):
-        st.subheader(f"{sname} ({sid_tw})")
-        c_y, c_fm = st.columns(2)
+        st.subheader(f"{sname} ({sid}.TW)")
         
-        with c_y:
-            if st.button(f"🔍 更新行情 ({sid})", key=f"y_{sid}"):
-                with st.spinner("讀取 Yahoo..."):
-                    h, s, err = fetch_market_data(sid_tw)
-                    if not h.empty:
-                        last_p = round(h['Close'].iloc[-1], 2)
-                        chg = ((last_p - h['Close'].iloc[-2]) / h['Close'].iloc[-2]) * 100
-                        vol = h['Volume'].iloc[-1]
-                        
-                        # 換手率公式：
-                        # $$Turnover\ Rate = \frac{Trading\ Volume}{Total\ Shares} \times 100\%$$
-                        turnover = (vol / s) * 100 if s > 0 else 0
-                        
-                        color = "red" if chg > 0 else "green"
-                        st.metric("現價", f"{last_p}", f"{chg:.2f}%")
-                        st.info(f"今日換手率: {turnover:.2f}%")
-                    else:
-                        st.error(f"錯誤: {err}")
-
-        with c_fm:
-            if st.button(f"📊 讀取籌碼 ({sid})", key=f"fm_{sid}"):
-                with st.spinner("讀取 FinMind..."):
-                    df = fetch_chips(sid)
-                    if not df.empty:
-                        last_d = df['date'].max()
-                        today = df[df['date'] == last_d]
-                        mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
-                        total_net = 0
-                        results = []
-                        for label, kw in mapping.items():
-                            r = today[today['name'].isin(kw)]
-                            if not r.empty:
-                                n = int((pd.to_numeric(r['buy']).sum() - pd.to_numeric(r['sell']).sum()) // 1000)
-                                total_net += n
-                                c = "red" if n > 0 else "green"
-                                results.append(f"{label}: <span style='color:{c}'>{n}張</span>")
-                        
-                        t_c = "red" if total_net > 0 else "green"
-                        st.write(f"🗓️ {last_d} | 合計: <span style='color:{t_c}'>{total_net}張</span>", unsafe_allow_html=True)
-                        st.markdown(f"<small>{' | '.join(results)}</small>", unsafe_allow_html=True)
-                    else:
-                        st.warning("籌碼資料讀取失敗，請檢查 API 狀態。")
+        # 顯示行情 (若有記憶數據)
+        if sid in st.session_state.market_results:
+            m = st.session_state.market_results[sid]
+            c1, c2, c3 = st.columns(3)
+            color = "red" if m['change'] > 0 else "green"
+            c1.metric("現價", f"{m['price']}", f"{m['change']:.2f}%")
+            c2.info(f"今日換手率: {m['turnover']:.2f}%")
+            c3.caption("數據來源: Yahoo Finance")
+        
+        # 顯示籌碼 (若有記憶數據)
+        if sid in st.session_state.chip_results:
+            c = st.session_state.chip_results[sid]
+            t_color = "red" if c['total'] > 0 else "green"
+            st.markdown(f"🗓️ **{c['date']}** | 三大法人合計: <span style='color:{t_color}'>{c['total']}張</span>", unsafe_allow_html=True)
+            st.write(" | ".join(c['details']))
