@@ -25,8 +25,8 @@ def calculate_metrics(df, total_shares):
     avg_vol_5d = df[vol_col].iloc[-6:-1].mean()
     vol_ratio = df[vol_col].iloc[-1] / avg_vol_5d if avg_vol_5d > 0 else 0
     
-    # 換手率：(今日成交股數 / 總發行張數*1000) * 100%
-    turnover = (df[vol_col].iloc[-1] / (total_shares * 1000)) * 100 if total_shares > 0 else 0
+    # 換手率：(今日成交股數 / 總發行股數) * 100%
+    turnover = (df[vol_col].iloc[-1] / total_shares) * 100 if total_shares > 0 else 0
     
     return {"price": close_t, "change": change_pct, "vol_ratio": vol_ratio, "turnover": turnover}
 
@@ -48,7 +48,7 @@ def show_kd_dialog(stock_id, name):
     dl = DataLoader()
     try: dl.login(token=TOKEN)
     except: pass
-    # 修正：確保傳入 API 的是乾淨的代號字串
+    # 修正：確保傳入 API 的是純代號數字字串
     pure_id = str(stock_id).split('.')[0].strip()
     df = dl.taiwan_stock_daily(stock_id=pure_id, start_date=(datetime.now()-timedelta(60)).strftime('%Y-%m-%d'))
     if df is not None and not df.empty:
@@ -90,21 +90,23 @@ for _, row in watchlist.iterrows():
         col_main, col_btn = st.columns([8, 2])
         with col_main:
             st.markdown(f"**{sname}** `{sid_full}`")
+            # 獲取日成交資料
             df_daily = dl.taiwan_stock_daily(stock_id=sid, start_date=(datetime.now()-timedelta(15)).strftime('%Y-%m-%d'))
             
             if df_daily is not None and not df_daily.empty:
-                # --- 配合「程式 1」的關鍵補強：多源獲取總張數 ---
+                # --- 配合「程式 1」的關鍵補強：多源獲取總股數 ---
                 try:
                     # 優先從持股分級表加總總股數，這是最精確的來源
                     poll = dl.taiwan_stock_shares_poll(stock_id=sid, start_date=(datetime.now()-timedelta(45)).strftime('%Y-%m-%d'))
                     if not poll.empty:
                         last_p = poll['date'].max()
-                        total_shares = poll[poll['date'] == last_p]['number_of_shares'].sum() // 1000
+                        total_shares = poll[poll['date'] == last_p]['number_of_shares'].sum()
                     else:
                         # 備援：從資產負債表換算
                         fs = dl.taiwan_stock_financial_statement(stock_id=sid, start_date=(datetime.now()-timedelta(365)).strftime('%Y-%m-%d'))
                         target = fs[fs['type'].str.contains('Ordinary_share_capital', na=False)]
-                        total_shares = (target['value'].iloc[-1] / 10 / 1000) if not target.empty else 0
+                        # 股數 = 股本金額 / 10元面額
+                        total_shares = (target['value'].iloc[-1] / 10) if not target.empty else 0
                 except:
                     total_shares = 0
                 
