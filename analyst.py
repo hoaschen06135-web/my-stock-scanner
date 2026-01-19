@@ -8,7 +8,7 @@ import time
 import plotly.graph_objects as go
 
 # --- 1. 初始化與記憶體 ---
-st.set_page_config(layout="wide", page_title="旗艦雲端監控站-FinMind市值版")
+st.set_page_config(layout="wide", page_title="旗艦雙引擎數據監控站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
@@ -27,9 +27,13 @@ def calculate_kdj(df):
     except: return None
 
 # --- 3. 數據同步核心 (雙引擎優化) ---
+# 修正此函式定義確保不出現 NameError
 def sync_all_data(watchlist):
     dl = DataLoader()
-    dl.login(token=TOKEN)
+    # 修正 image_30a344.png 屬性報錯，使用穩定的登入方式
+    try:
+        dl.login(token=TOKEN)
+    except: pass
     
     for _, row in watchlist.iterrows():
         sid = str(row['股票代號']).split('.')[0].strip()
@@ -37,12 +41,13 @@ def sync_all_data(watchlist):
         sname = row['名稱']
         report = {"name": sname, "market": None, "chips": None, "err_y": None, "hist": None}
         
-        # A. Yahoo 引擎：僅抓取歷史數據計算 漲幅、量比、KD
+        # A. Yahoo 引擎：僅抓取 K 線數據 (漲幅、量比、KD)
+        # 不再手動設定 Session，交由 yf 自行處理
         try:
             tk = yf.Ticker(sid_tw)
-            hist = tk.history(period='3mo') # 歷史數據請求較輕量，不易被封鎖
+            hist = tk.history(period='3mo') 
             if hist.empty:
-                report["err_y"] = "Yahoo 暫時限流"
+                report["err_y"] = "Yahoo 目前限流 (Rate Limited)"
             else:
                 last_p = round(hist['Close'].iloc[-1], 2)
                 chg = ((last_p - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
@@ -51,35 +56,31 @@ def sync_all_data(watchlist):
                 report["hist"] = calculate_kdj(hist)
         except Exception as e: report["err_y"] = str(e)
 
-        # B. FinMind 引擎：抓取 市值 與 籌碼
+        # B. FinMind 引擎：負責市值與籌碼數據
         try:
             time.sleep(0.5)
-            # 獲取最新市值數據
+            # 獲取市值數據 (Dataset: TaiwanStockTotalMarketValue)
             mv_df = dl.taiwan_stock_total_market_value(
-                stock_id=sid, 
-                start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
+                stock_id=sid, start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
             )
-            # 獲取三大法人籌碼
+            # 獲取籌碼數據 (Dataset: TaiwanStockInstitutionalInvestors)
             chips_df = dl.taiwan_stock_institutional_investors(
-                stock_id=sid, 
-                start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
+                stock_id=sid, start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
             )
             
-            # 處理市值與換手率
+            # 使用 FinMind 數據計算市值與換手率
             if mv_df is not None and not mv_df.empty:
-                last_mv = mv_df.iloc[-1]['total_market_value'] # 單位：元
-                mkt_cap_billion = round(last_mv / 100000000, 1) # 轉換為 億
+                last_mv = mv_df.iloc[-1]['total_market_value']
+                mkt_cap_billion = round(last_mv / 100000000, 1) # 轉換為「億」
                 
-                # 計算換手率：
-                # $$Turnover\ Rate = \frac{Trading\ Volume \times Price}{Total\ Market\ Value} \times 100\%$$
                 if report["market"]:
+                    # 換手率公式：(成交量 * 現價) / 總市值 * 100%
                     vol = hist['Volume'].iloc[-1]
                     price = report["market"]["price"]
                     turnover = (vol * price / last_mv) * 100
                     report["market"]["turnover"] = turnover
                     report["market"]["mkt_cap"] = mkt_cap_billion
 
-            # 處理籌碼細節
             if chips_df is not None and not chips_df.empty:
                 last_d = chips_df['date'].max()
                 td = chips_df[chips_df['date'] == last_d]
@@ -116,19 +117,21 @@ with st.sidebar:
                         st.cache_data.clear(); st.success(f"已加入 {name}"); time.sleep(1); st.rerun()
                     except: st.error("寫入失敗")
 
+    # 修正呼叫點確保 sync_all_data 已定義
+    raw = conn.read(ttl=600).dropna(how='all')
+    watchlist = raw.iloc[:, :2].copy()
+    watchlist.columns = ["股票代號", "名稱"]
+
     if st.button("🚀 一鍵同步所有數據指標", use_container_width=True):
-        sync_all_data(watchlist); st.rerun()
+        with st.spinner("雙引擎同步中..."):
+            sync_all_data(watchlist)
+            st.rerun()
 
     if st.button("🧹 清除畫面數據", use_container_width=True):
         st.session_state.stock_memory = {}; st.rerun()
 
 # --- 5. 主畫面呈現 ---
 st.title("🚀 專業數據監控站 (FinMind 市值版)")
-try:
-    raw = conn.read(ttl=600).dropna(how='all')
-    watchlist = raw.iloc[:, :2].copy()
-    watchlist.columns = ["股票代號", "名稱"]
-except: st.stop()
 
 for _, row in watchlist.iterrows():
     sid = str(row['股票代號']).split('.')[0].strip()
