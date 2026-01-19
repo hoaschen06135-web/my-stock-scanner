@@ -10,8 +10,9 @@ import plotly.graph_objects as go
 
 # --- 1. 環境設定與初始化 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(layout="wide", page_title="台股雲端篩選系統")
+st.set_page_config(layout="wide", page_title="台股雲端精確篩選系統")
 
+# 初始化關注名單
 if 'watchlist' not in st.session_state:
     st.session_state['watchlist'] = []
 
@@ -30,7 +31,7 @@ def get_cleaned_tickers():
                 if '　' in str(val):
                     parts = val.split('　')
                     if len(parts) >= 2:
-                        code, name = parts[0], parts[1]
+                        code, name = parts[0].strip(), parts[1].strip()
                         if code.isdigit() and len(code) == 4:
                             ticker_data.append(f"{code}{suffix},{name}")
         except: continue
@@ -41,13 +42,19 @@ def fetch_stock_data(tickers_with_names, mode="fast", low=0.0, high=10.0):
     mapping = {t.split(',')[0]: t.split(',')[1] for t in tickers_with_names}
     tickers = list(mapping.keys())
     data = yf.download(tickers, period="6d", group_by='ticker', progress=False)
+    
     results = []
     for t in tickers:
         try:
             t_data = data[t]
             if t_data.empty or len(t_data) < 2: continue
+            # 確保欄位是平坦的 (處理 yfinance v0.2+ 格式)
+            if isinstance(t_data.columns, pd.MultiIndex):
+                t_data.columns = t_data.columns.get_level_values(0)
+            
             c_now, c_pre = t_data['Close'].iloc[-1], t_data['Close'].iloc[-2]
             change = ((c_now - c_pre) / c_pre) * 100
+            
             if mode == "fast" and not (low <= change <= high): continue
             
             vol_avg = t_data['Volume'].iloc[:-1].mean()
@@ -64,80 +71,96 @@ def fetch_stock_data(tickers_with_names, mode="fast", low=0.0, high=10.0):
         except: continue
     return pd.DataFrame(results)
 
-# --- 3. KD 線彈窗函數 ---
+# --- 3. KD 線彈窗函數 (修正版本) ---
 @st.dialog("個股 KD 指標分析")
 def show_kd_window(item):
     code, name = item.split(',')[0], item.split(',')[1]
     df = yf.download(code, period="1mo", progress=False)
-    if not df.empty and len(df) > 9:
-        # 簡易 KD 計算
-        low_min = df['Low'].rolling(9).min()
-        high_max = df['High'].rolling(9).max()
+    
+    if not df.empty and len(df) >= 9:
+        # 修正欄位格式
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        # 穩定版 KD 計算 (解決 ValueError)
+        low_min = df['Low'].rolling(window=9).min()
+        high_max = df['High'].rolling(window=9).max()
         rsv = (df['Close'] - low_min) / (high_max - low_min) * 100
-        k, d = [50.0], [50.0]
+        rsv = rsv.fillna(50) # 預先處理空值，不要在迴圈中修改
+        
+        k_vals, d_vals = [50.0], [50.0]
         for i in range(1, len(rsv)):
-            if pd.isna(rsv.iloc[i]): rsv.iloc[i] = 50
-            k.append(k[-1] * (2/3) + rsv.iloc[i] * (1/3))
-            d.append(d[-1] * (2/3) + k[-1] * (1/3))
-        df['K'], df['D'] = k, d
+            current_k = k_vals[-1] * (2/3) + rsv.iloc[i] * (1/3)
+            current_d = d_vals[-1] * (2/3) + current_k * (1/3)
+            k_vals.append(current_k)
+            d_vals.append(current_d)
+            
+        df['K'], df['D'] = k_vals, d_vals
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=df['K'], name='K值'))
-        fig.add_trace(go.Scatter(x=df.index, y=df['D'], name='D值'))
-        fig.update_layout(yaxis=dict(range=[0, 100]), height=300)
+        fig.add_trace(go.Scatter(x=df.index, y=df['K'], name='K線 (藍)', line=dict(color='blue')))
+        fig.add_trace(go.Scatter(x=df.index, y=df['D'], name='D線 (橘)', line=dict(color='orange')))
+        fig.update_layout(
+            yaxis=dict(range=[0, 100], title="數值"),
+            height=350, margin=dict(l=0, r=0, t=30, b=0)
+        )
+        # 加入 20/80 參考線
+        fig.add_hline(y=80, line_dash="dash", line_color="red")
+        fig.add_hline(y=20, line_dash="dash", line_color="green")
         st.plotly_chart(fig, use_container_width=True)
-    if st.button("關閉"): st.rerun()
+    else:
+        st.error("數據不足，無法計算 KD 線。")
+    if st.button("關閉視窗"): st.rerun()
 
-# --- 4. 側邊欄與分頁 ---
+# --- 4. 導覽選單 ---
 st.sidebar.title("🚀 股市導航選單")
-# 關鍵：這裡必須定義 page 變數
 page = st.sidebar.radio("請選擇頁面：", ["全市場分組掃描", "我的關注清單"])
-
 st.sidebar.markdown("---")
-single_q = st.sidebar.text_input("🔍 快速查詢", placeholder="例如: 2330")
 
-# --- 5. 頁面邏輯 (解決 NameError) ---
+# --- 5. 頁面邏輯 ---
 if page == "全市場分組掃描":
     st.header("⚖️ 台股全市場篩選")
     low_in = st.sidebar.number_input("漲幅下限 (%)", value=0.0)
     high_in = st.sidebar.number_input("漲幅上限 (%)", value=10.0)
     
     tickers = get_cleaned_tickers()
-    groups = [tickers[i:i+100] for i in range(0, len(tickers), 100)]
-    sel_g = st.sidebar.selectbox("選擇群組", [f"第 {i+1} 組" for i in range(len(groups))])
+    num_per_group = 100
+    num_groups = math.ceil(len(tickers) / num_per_group)
+    sel_g = st.sidebar.selectbox("選擇掃描群組", [f"第 {i+1} 組" for i in range(num_groups)])
     
     if st.button("🚀 開始掃描"):
         idx = int(sel_g.split(' ')[1]) - 1
-        st.session_state['scan_df'] = fetch_stock_data(groups[idx], mode="fast", low=low_in, high=high_in)
+        current_list = tickers[idx*num_per_group : (idx+1)*num_per_group]
+        st.session_state['scan_df'] = fetch_stock_data(current_list, low=low_in, high=high_in)
 
     if 'scan_df' in st.session_state:
         df = st.session_state['scan_df']
-        df["選取"] = df["漲幅"].apply(lambda x: 3.0 <= x <= 5.0)
+        df["選取"] = df["漲幅"].apply(lambda x: 3.0 <= x <= 5.0) # 自動勾選
         edit_df = st.data_editor(df, hide_index=True, key="scan_editor")
         
-        if st.button("➕ 加入關注"):
+        if st.button("➕ 將勾選股票加入關注清單"):
             to_add = edit_df[edit_df["選取"] == True]
             for _, row in to_add.iterrows():
                 item = f"{row['股票代號']},{row['名稱']}"
                 if item not in st.session_state['watchlist']:
                     st.session_state['watchlist'].append(item)
-            st.success("已加入清單")
+            st.success(f"已加入 {len(to_add)} 支股票")
 
 elif page == "我的關注清單":
     st.header("⭐ 我的關注清單")
     if not st.session_state['watchlist']:
-        st.info("尚無關注股票")
+        st.info("尚無關注股票，請至掃描頁面加入。")
     else:
-        if st.button("🔄 刷新數據") or 'watch_df' not in st.session_state:
+        if st.button("🔄 刷新全部數據") or 'watch_df' not in st.session_state:
             st.session_state['watch_df'] = fetch_stock_data(st.session_state['watchlist'], mode="full")
         
         watch_df = st.session_state['watch_df']
         for i, row in watch_df.iterrows():
-            col1, col2, col3 = st.columns([3, 1, 1])
-            col1.write(f"**{row['名稱']}** ({row['股票代號']}) | 漲幅: {row['漲幅']}%")
-            if col2.button("📈 KD線", key=f"kd_{row['股票代號']}"):
+            c1, c2, c3 = st.columns([3, 1, 1])
+            c1.write(f"**{row['名稱']}** ({row['股票代號']}) | 漲幅: {row['漲幅']}% | 量比: {row['量比']}")
+            if c2.button("📈 KD線", key=f"kd_{row['股票代號']}"):
                 show_kd_window(f"{row['股票代號']},{row['名稱']}")
-            if col3.button("❌ 移除", key=f"rm_{row['股票代號']}"):
+            if c3.button("❌ 移除", key=f"rm_{row['股票代號']}"):
                 item = f"{row['股票代號']},{row['名稱']}"
                 st.session_state['watchlist'].remove(item)
                 st.session_state.pop('watch_df', None)
