@@ -38,11 +38,10 @@ def get_cleaned_tickers():
     return sorted(list(set(ticker_data)))
 
 def fetch_stock_data(tickers_with_names, mode="fast", low_chg=0.0, high_chg=10.0, low_vol=0.0, high_vol=99.0, low_turn=0.0, high_turn=99.0):
-    """抓取數據並根據側邊欄輸入進行多重篩選"""
+    """根據多重參數篩選股票"""
     if not tickers_with_names: return pd.DataFrame()
     mapping = {t.split(',')[0]: t.split(',')[1] for t in tickers_with_names}
     tickers = list(mapping.keys())
-    # 抓取 6 天數據
     data = yf.download(tickers, period="6d", group_by='ticker', progress=False)
     
     results = []
@@ -53,7 +52,6 @@ def fetch_stock_data(tickers_with_names, mode="fast", low_chg=0.0, high_chg=10.0
             if isinstance(t_data.columns, pd.MultiIndex):
                 t_data.columns = t_data.columns.get_level_values(0)
             
-            # 指標計算
             c_now, c_pre = t_data['Close'].iloc[-1], t_data['Close'].iloc[-2]
             change = round(((c_now - c_pre) / c_pre) * 100, 2)
             
@@ -64,7 +62,7 @@ def fetch_stock_data(tickers_with_names, mode="fast", low_chg=0.0, high_chg=10.0
             turnover = round((t_data['Volume'].iloc[-1] / info.get('sharesOutstanding', 1)) * 100, 2)
             mcap = f"{round(info.get('marketCap', 0) / 1e8, 2)} 億"
 
-            # 根據手動輸入的數值進行篩選
+            # 執行背景篩選
             if not (low_chg <= change <= high_chg): continue
             if not (low_vol <= vol_ratio <= high_vol): continue
             if not (low_turn <= turnover <= high_turn): continue
@@ -79,7 +77,7 @@ def fetch_stock_data(tickers_with_names, mode="fast", low_chg=0.0, high_chg=10.0
 # --- 3. KD 線彈窗函數 ---
 @st.dialog("個股 KD 指標分析")
 def show_kd_window(item):
-    """彈出小視窗顯示圖表與數值"""
+    """修復版 KD 計算"""
     code, name = item.split(',')[0], item.split(',')[1]
     df = yf.download(code, period="1mo", progress=False)
     if not df.empty and len(df) >= 9:
@@ -95,43 +93,45 @@ def show_kd_window(item):
             k.append(curr_k); d.append(curr_d)
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=k, name='K值 (藍)', line=dict(color='blue')))
-        fig.add_trace(go.Scatter(x=df.index, y=d, name='D值 (橘)', line=dict(color='orange')))
+        fig.add_trace(go.Scatter(x=df.index, y=k, name='K線', line=dict(color='blue')))
+        fig.add_trace(go.Scatter(x=df.index, y=d, name='D線', line=dict(color='orange')))
         fig.update_layout(yaxis=dict(range=[0, 100]), height=350, margin=dict(l=0, r=0, t=30, b=0))
         fig.add_hline(y=80, line_dash="dash", line_color="red")
         fig.add_hline(y=20, line_dash="dash", line_color="green")
         st.plotly_chart(fig, use_container_width=True)
     if st.button("關閉視窗"): st.rerun()
 
-# --- 4. 側邊欄導覽與篩選輸入 ---
+# --- 4. 側邊欄與分頁導覽 ---
 st.sidebar.title("🚀 股市導航選單")
 page = st.sidebar.radio("請選擇頁面：", ["全市場分組掃描", "我的關注清單"])
-
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔍 篩選參數設定")
-
-# 漲幅手動輸入
-low_chg = st.sidebar.number_input("漲幅下限 (%)", value=3.0, step=0.1)
-high_chg = st.sidebar.number_input("漲幅上限 (%)", value=5.0, step=0.1)
-
-# 量比手動輸入 (新功能)
-low_vol = st.sidebar.number_input("量比下限", value=1.0, step=0.1)
-high_vol = st.sidebar.number_input("量比上限", value=99.0, step=1.0)
-
-# 換手率手動輸入 (新功能)
-low_turn = st.sidebar.number_input("換手率下限 (%)", value=3.0, step=0.1)
-high_turn = st.sidebar.number_input("換手率上限 (%)", value=5.0, step=0.1)
 
 # --- 5. 頁面邏輯 ---
 if page == "全市場分組掃描":
     st.header("⚖️ 台股全市場精確篩選系統")
+    
+    # 讀取名單並分組
     tickers = get_cleaned_tickers()
     num_p_g = 100
     num_g = math.ceil(len(tickers) / num_p_g)
-    sel_g = st.sidebar.selectbox("選擇掃描群組", [f"第 {i+1} 組" for i in range(num_g)])
+    
+    # --- 調整位置：群組選擇移至最上方 ---
+    st.sidebar.subheader("📦 選擇掃描群組")
+    sel_g = st.sidebar.selectbox("每組 100 支標的", [f"第 {i+1} 組" for i in range(num_g)])
+    
+    st.sidebar.markdown("---")
+    
+    # --- 篩選參數設定區 ---
+    st.sidebar.subheader("🔍 篩選參數設定")
+    low_chg = st.sidebar.number_input("漲幅下限 (%)", value=3.0, step=0.1)
+    high_chg = st.sidebar.number_input("漲幅上限 (%)", value=5.0, step=0.1)
+    low_vol = st.sidebar.number_input("量比下限", value=1.0, step=0.1)
+    high_vol = st.sidebar.number_input("量比上限", value=99.0, step=1.0)
+    low_turn = st.sidebar.number_input("換手率下限 (%)", value=3.0, step=0.1)
+    high_turn = st.sidebar.number_input("換手率上限 (%)", value=5.0, step=0.1)
     
     if st.button("🚀 開始掃描"):
-        with st.spinner(f"正在分析並過濾數據..."):
+        with st.spinner(f"正在分析並過濾 {sel_g}..."):
             idx = int(sel_g.split(' ')[1]) - 1
             st.session_state['scan_df'] = fetch_stock_data(
                 tickers[idx*num_p_g : (idx+1)*num_p_g], 
@@ -142,8 +142,7 @@ if page == "全市場分組掃描":
 
     if 'scan_df' in st.session_state:
         df_scan = st.session_state['scan_df']
-        st.subheader(f"符合條件標的 (共 {len(df_scan)} 支)")
-        # 顯示結果表格，選取預設為 False
+        st.subheader(f"篩選結果 (符合多重條件共 {len(df_scan)} 支標的)")
         edit_df = st.data_editor(df_scan, hide_index=True, key="scan_editor", use_container_width=True)
         
         if st.button("➕ 將勾選股票加入關注清單"):
@@ -157,9 +156,9 @@ if page == "全市場分組掃描":
 elif page == "我的關注清單":
     st.header("⭐ 我的關注清單")
     if not st.session_state['watchlist']:
-        st.info("尚無關注股票。")
+        st.info("尚無關注股票，請至掃描頁面手動勾選加入。")
     else:
-        if st.button("🔄 刷新最新數據") or 'watch_df' not in st.session_state:
+        if st.button("🔄 刷新全清單數據") or 'watch_df' not in st.session_state:
             st.session_state['watch_df'] = fetch_stock_data(st.session_state['watchlist'], mode="full")
         
         watch_df = st.session_state['watch_df']
