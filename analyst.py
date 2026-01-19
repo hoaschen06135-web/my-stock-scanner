@@ -5,42 +5,43 @@ from streamlit_gsheets import GSheetsConnection
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 
-# --- 1. 環境設定 ---
+# --- 1. 環境初始化 ---
 st.set_page_config(layout="wide", page_title="行動分析站")
 conn = st.connection("gsheets", type=GSheetsConnection)
-# 確保 Secrets 中有設定此金鑰
-TOKEN = st.secrets["FINMIND_TOKEN"] 
+TOKEN = st.secrets["FINMIND_TOKEN"]
 
-# --- 2. KD 計算函數 (9, 3, 3) ---
+# --- 2. KD 計算函數 ---
 def calculate_kd(df):
-    """計算台股標準 KD 指標"""
+    """計算台股標準 KD (9, 3, 3)"""
     low_min = df['low'].rolling(window=9).min()
     high_max = df['high'].rolling(window=9).max()
-    # RSV 公式: (今日收盤 - 9日最低) / (9日最高 - 9日最低) * 100
     rsv = (df['close'] - low_min) / (high_max - low_min) * 100
     rsv = rsv.fillna(50)
     
     k_list, d_list = [50.0], [50.0]
     for i in range(1, len(rsv)):
-        # 遞迴平滑公式
         k = k_list[-1] * (2/3) + rsv.iloc[i] * (1/3)
         d = d_list[-1] * (2/3) + k * (1/3)
         k_list.append(k); d_list.append(d)
     df['K'], df['D'] = k_list, d_list
     return df
 
-# --- 3. 分析彈窗 ---
+# --- 3. 分析彈窗 (修正 TypeError) ---
 @st.dialog("📈 個股深度分析")
 def show_kd_dialog(stock_id, name):
     st.write(f"### {name} ({stock_id})")
-    with st.spinner("獲取數據中..."):
+    with st.spinner("連線數據源..."):
         dl = DataLoader()
-        # 直接在方法中傳入 token，避開 AttributeError
+        # 修正：先登入，不直接在下載函數傳 token
+        try:
+            dl.login(token=TOKEN)
+        except:
+            pass # 避免部分版本 login 報錯
+            
         start_dt = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
         df = dl.taiwan_stock_daily(
             stock_id=stock_id.split('.')[0], 
-            start_date=start_dt,
-            token=TOKEN
+            start_date=start_dt
         )
         
         if not df.empty:
@@ -53,24 +54,28 @@ def show_kd_dialog(stock_id, name):
             fig.add_hline(y=20, line_dash="dash", line_color="green")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.error("無法取得數據，請確認 Token 是否有效。")
+            st.error("無法抓取歷史數據。")
 
-# --- 4. 主介面 ---
+# --- 4. 主介面：讀取名單並處理欄位偏移 ---
 st.title("⭐ 雲端關注清單監控")
 
-# 讀取試算表，指定正確的欄位
 try:
     watchlist = conn.read()
-    # 修正欄位偏移問題：強制只取這兩欄
+    # 解決 image_22aceb.png 的欄位偏移問題
     if watchlist is not None and not watchlist.empty:
-        watchlist = watchlist[["股票代號", "名稱"]]
-except Exception as e:
-    st.error(f"讀取失敗，請確認試算表欄位是否正確 (A1:股票代號, B1:名稱)。")
+        # 尋找包含關鍵字的欄位，不論它在 A 欄還是 B 欄
+        col_id = [c for c in watchlist.columns if "代號" in c][0]
+        col_name = [c for c in watchlist.columns if "名稱" in c][0]
+        watchlist = watchlist[[col_id, col_name]].dropna()
+        watchlist.columns = ["股票代號", "名稱"] # 重新命名統一化
+except:
+    st.info("請先使用掃描器同步股票至雲端。")
     st.stop()
 
-if watchlist is not None and not watchlist.empty:
+if not watchlist.empty:
     dl = DataLoader()
-    st.markdown("---")
+    try: dl.login(token=TOKEN)
+    except: pass
     
     for _, row in watchlist.iterrows():
         sid, sname = str(row['股票代號']), str(row['名稱'])
@@ -85,8 +90,7 @@ if watchlist is not None and not watchlist.empty:
                 # 抓取法人買賣超
                 inst_df = dl.taiwan_stock_institutional_investors_buy_sell(
                     stock_id=pure_id, 
-                    start_date=start_c,
-                    token=TOKEN
+                    start_date=start_c
                 )
                 if not inst_df.empty:
                     last_dt = inst_df['date'].max()
@@ -98,10 +102,7 @@ if watchlist is not None and not watchlist.empty:
                         chips.append(f"{r['name']}: <span style='color:{color}'>{net}張</span>")
                     st.markdown(f"🗓️ {last_dt}<br>{' | '.join(chips)}", unsafe_allow_html=True)
             except:
-                st.caption("暫無籌碼數據")
+                st.caption("連線中...")
 
         if c3.button("📈 分析", key=f"btn_{pure_id}"):
             show_kd_dialog(sid, sname)
-    
-    if st.button("🔄 刷新頁面"):
-        st.rerun()
