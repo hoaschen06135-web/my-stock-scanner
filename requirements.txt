@@ -4,4 +4,3 @@ yfinance
 FinMind
 st-gsheets-connection
 tqdm
-requests
