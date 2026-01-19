@@ -40,6 +40,7 @@ def show_kd_dialog(ticker, name):
 
 # --- 2. 數據處理函數 ---
 def sync_to_sheets(watchlist):
+    """將清單同步回 Google Sheets"""
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
         new_df = pd.DataFrame({"ticker_item": watchlist})
@@ -71,9 +72,10 @@ def fetch_live_data(tickers_with_names, l_chg=-10, l_vol=0):
             change = round(((c_now - c_pre) / c_pre) * 100, 2)
             vol_ratio = round(t_data['Volume'].iloc[-1] / t_data['Volume'].iloc[:-1].mean(), 2)
             
-            if change >= l_chg and vol_ratio >= l_vol:
-                results.append({"選取": False, "股票代號": t, "名稱": mapping[t], 
-                                "漲幅(%)": change, "量比": vol_ratio, "目前價格": round(c_now, 2)})
+            results.append({
+                "股票代號": t, "名稱": mapping[t], 
+                "漲幅(%)": change, "量比": vol_ratio, "目前價格": round(c_now, 2)
+            })
         except: continue
     return pd.DataFrame(results)
 
@@ -102,11 +104,12 @@ if page == "全市場分組掃描":
     if 'scan_res' in st.session_state:
         df = st.session_state['scan_res']
         if not df.empty:
+            # 增加選取欄位
+            df.insert(0, "選取", False)
             edit_df = st.data_editor(df, hide_index=True, use_container_width=True, key="editor")
             if st.button("➕ 同步選中項目至雲端清單"):
                 to_add = edit_df[edit_df["選取"] == True]
                 new_items = [f"{r['股票代號']},{r['名稱']}" for _, r in to_add.iterrows()]
-                # 從雲端獲取現有清單進行合併
                 try:
                     conn = st.connection("gsheets", type=GSheetsConnection)
                     df_cloud = conn.read(worksheet="Sheet1", ttl="0")
@@ -117,7 +120,7 @@ if page == "全市場分組掃描":
 
 elif page == "我的關注清單":
     st.header("⭐ 我的雲端關注清單")
-    if st.button("🔄 即時更新數據"):
+    if st.button("🔄 刷新即時數據"):
         st.cache_data.clear()
         st.rerun()
 
@@ -127,18 +130,33 @@ elif page == "我的關注清單":
         watchlist = df_cloud["ticker_item"].dropna().tolist() if not df_cloud.empty else []
         
         if watchlist:
-            live_df = fetch_live_data(watchlist)
-            st.info("💡 提示：點擊下方表格選中股票後，再點擊下方按鈕即可彈出 KD 線圖。")
+            with st.spinner("抓取即時行情中..."):
+                live_df = fetch_live_data(watchlist)
             
-            # 修正關鍵：將 single_row 改為 single-row (橫線)
+            st.info("💡 提示：點擊下方表格選中一列後，即可進行『技術分析』或『刪除股票』。")
+            
+            # 使用正確的橫線語法 single-row
             event = st.dataframe(live_df, on_select="rerun", selection_mode="single-row", use_container_width=True, hide_index=True)
             
             if event.selection.rows:
                 idx = event.selection.rows[0]
                 row = live_df.iloc[idx]
-                if st.button(f"📊 彈出 {row['名稱']} ({row['股票代號']}) KD 視窗"):
-                    show_kd_dialog(row['股票代號'], row['名稱'])
+                
+                # 放置功能按鈕
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button(f"📊 查看 {row['名稱']} KD 視窗", use_container_width=True):
+                        show_kd_dialog(row['股票代號'], row['名稱'])
+                with col2:
+                    # 🗑️ 新增刪除功能
+                    if st.button(f"🗑️ 從雲端刪除 {row['名稱']}", type="secondary", use_container_width=True):
+                        # 重新計算清單，排除掉目前選中的這檔股票
+                        ticker_to_remove = row['股票代號']
+                        updated_watchlist = [item for item in watchlist if not item.startswith(f"{ticker_to_remove},")]
+                        if sync_to_sheets(updated_watchlist):
+                            st.success(f"✅ 已成功刪除 {row['名稱']}")
+                            st.rerun() # 刪除後自動刷新頁面
         else:
-            st.info("清單目前是空的。")
+            st.info("目前清單是空的。")
     except Exception as e:
         st.error(f"連線雲端失敗：{e}")
