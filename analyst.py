@@ -7,15 +7,15 @@ from datetime import datetime, timedelta
 import time
 import plotly.graph_objects as go
 
-# --- 1. 初始化環境與記憶體 ---
-st.set_page_config(layout="wide", page_title="旗艦診斷監控站")
+# --- 1. 初始化與記憶體 ---
+st.set_page_config(layout="wide", page_title="旗艦數據分析站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
 if 'stock_memory' not in st.session_state:
     st.session_state.stock_memory = {}
 
-# --- 2. 技術指標計算 (KDJ) ---
+# --- 2. KDJ 指標計算 ---
 def calculate_kdj(df):
     try:
         low_9 = df['Low'].rolling(window=9).min()
@@ -39,7 +39,7 @@ def sync_all_data(watchlist):
             tk = yf.Ticker(sid_tw)
             hist = tk.history(period='3mo')
             if hist.empty:
-                report["err_y"] = "Yahoo 回傳空數據"
+                report["err_y"] = "Yahoo 目前限流 (Rate Limited)"
             else:
                 shares = tk.info.get('sharesOutstanding', 0)
                 last_p = round(hist['Close'].iloc[-1], 2)
@@ -49,8 +49,8 @@ def sync_all_data(watchlist):
                 mkt_cap = (last_p * shares) / 100000000
                 report["market"] = {"price": last_p, "change": chg, "v_ratio": v_ratio, "turnover": turnover, "mkt_cap": mkt_cap}
                 report["hist"] = calculate_kdj(hist)
-        except Exception as ey:
-            report["err_y"] = str(ey)
+        except Exception as e:
+            report["err_y"] = str(e)
 
         try:
             time.sleep(0.3)
@@ -73,35 +73,38 @@ def sync_all_data(watchlist):
 with st.sidebar:
     st.header("⚙️ 控制面板")
     
-    # --- 核心更新：只需編號即可新增 ---
     with st.expander("➕ 新增股票 (只需編號)"):
-        with st.form("add_form"):
-            add_sid = st.text_input("股票代號 (如 3015)")
-            custom_name = st.text_input("自定義名稱 (留空則自動抓取)")
-            if st.form_submit_button("確認加入 Sheets"):
+        with st.form("add_form", clear_on_submit=True):
+            add_sid = st.text_input("股票代號 (如 2330)")
+            custom_name = st.text_input("自定義名稱 (選填)")
+            submitted = st.form_submit_button("確認加入 Sheets")
+            
+            if submitted:
                 if add_sid:
+                    # 階段一：獲取名稱 (獨立處理 Yahoo 限流)
+                    final_name = custom_name
+                    if not final_name:
+                        try:
+                            # 嘗試獲取，失敗不崩潰
+                            tk = yf.Ticker(f"{add_sid}.TW")
+                            final_name = tk.info.get('shortName') or tk.info.get('longName')
+                        except:
+                            final_name = None
+                    
+                    if not final_name: final_name = f"股票 {add_sid}"
+                    
+                    # 階段二：寫入 Sheets
                     try:
-                        # 1. 自動抓取中文名稱
-                        final_name = custom_name
-                        if not final_name:
-                            with st.spinner("正在查詢股票名稱..."):
-                                tk_info = yf.Ticker(f"{add_sid}.TW").info
-                                final_name = tk_info.get('shortName') or tk_info.get('longName')
-                                if not final_name: # 嘗試上櫃格式
-                                    final_name = yf.Ticker(f"{add_sid}.TWO").info.get('shortName')
-                        
-                        if not final_name: final_name = f"股票 {add_sid}"
-                        
-                        # 2. 寫入 Sheets
-                        df_old = conn.read().dropna(how='all')
-                        df_new = pd.DataFrame([[add_sid, final_name]], columns=df_old.columns[:2])
+                        raw_df = conn.read()
+                        df_old = raw_df.dropna(how='all') if raw_df is not None else pd.DataFrame(columns=["股票代號", "名稱"])
+                        df_new = pd.DataFrame([[str(add_sid), final_name]], columns=df_old.columns[:2])
                         conn.update(data=pd.concat([df_old, df_new], ignore_index=True))
-                        st.success(f"已加入: {final_name}")
+                        st.success(f"✅ 已加入: {final_name}")
                         time.sleep(1); st.rerun()
                     except Exception as e:
-                        st.error(f"寫入失敗，請確認 Sheets 權限: {e}")
+                        st.error(f"❌ 寫入失敗: {e}")
                 else:
-                    st.warning("請輸入股票編號")
+                    st.warning("請輸入代號")
 
     try:
         raw = conn.read().dropna(how='all')
@@ -115,13 +118,15 @@ with st.sidebar:
     if st.button("🧹 清除快取記憶", use_container_width=True):
         st.session_state.stock_memory = {}; st.rerun()
 
-# --- 5. 主畫面呈現 ---
-st.title("🚀 專業監控站 (全功能版)")
+# --- 5. 主畫面呈現 (包含常駐數據與 KD 彈窗) ---
+st.title("🚀 專業監控站 (旗艦全功能版)")
 
 for _, row in watchlist.iterrows():
     sid = str(row['股票代號']).split('.')[0].strip()
     with st.container(border=True):
         col_title, col_kd = st.columns([7, 3])
+        
+        # 名稱與 KD 按鈕 (並排)
         if sid in st.session_state.stock_memory:
             d = st.session_state.stock_memory[sid]
             with col_title: st.subheader(f"{d['name']} ({sid}.TW)")
@@ -134,6 +139,10 @@ for _, row in watchlist.iterrows():
                         fig.update_layout(height=250, margin=dict(l=0, r=0, t=0, b=0))
                         st.plotly_chart(fig, use_container_width=True)
             
+            # 顯示故障診斷
+            if d["err_y"]: st.error(f"⚠️ 行情故障: {d['err_y']}")
+            
+            # 四大指標列
             if d["market"]:
                 m = d["market"]; c1, c2, c3, c4 = st.columns(4)
                 c1.metric("現價/漲幅", f"{m['price']}", f"{m['change']:.2f}%")
@@ -141,9 +150,10 @@ for _, row in watchlist.iterrows():
                 c3.metric("換手率", f"{m['turnover']:.2f}%")
                 c4.metric("流通市值", f"{m['mkt_cap']:.1f} 億")
             
+            # 籌碼與常駐數據
             if d["chips"]:
                 c = d["chips"]; t_col = "red" if c['total'] > 0 else "green"
-                st.markdown(f"<div style='background-color:#f0f2f6; padding:10px; border-radius:5px;'>🗓️ {c['date']} | 合計: <span style='color:{t_col}; font-weight:bold;'>{c['total']}張</span><br><small>{c['details']}</small></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='background-color:#f0f2f6; padding:10px; border-radius:5px;'>🗓️ {c['date']} | 法人合計: <span style='color:{t_col}; font-weight:bold;'>{c['total']}張</span><br><small>{c['details']}</small></div>", unsafe_allow_html=True)
         else:
             st.subheader(f"{row['名稱']} ({sid}.TW)")
-            st.caption("尚未同步，請點擊左側「一鍵同步」按鈕。")
+            st.caption("尚未獲取數據，請點擊左側「一鍵同步」。")
