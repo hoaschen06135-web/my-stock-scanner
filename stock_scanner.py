@@ -38,7 +38,7 @@ def show_kd_dialog(ticker, name):
         else:
             st.error("無法讀取歷史數據")
 
-# --- 2. 核心數據處理函數 ---
+# --- 2. 數據處理函數 ---
 def sync_to_sheets(watchlist):
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
@@ -57,17 +57,16 @@ def get_cleaned_tickers():
     return [f"{str(val).split('　')[0]}.TW,{str(val).split('　')[1]}" for val in df[0] 
             if '　' in str(val) and str(val).split('　')[0].isdigit()]
 
-def fetch_live_data(tickers_with_names, l_chg=0, l_vol=0):
+def fetch_live_data(tickers_with_names, l_chg=-10, l_vol=0):
     if not tickers_with_names: return pd.DataFrame()
     mapping = {t.split(',')[0]: t.split(',')[1] for t in tickers_with_names}
-    # 抓取 6 天數據以計算量比
     data = yf.download(list(mapping.keys()), period="6d", group_by='ticker', progress=False)
     
     results = []
     for t in mapping.keys():
         try:
             t_data = data[t] if len(mapping) > 1 else data
-            if t_data.empty: continue
+            if t_data.empty or len(t_data) < 2: continue
             c_now, c_pre = t_data['Close'].iloc[-1], t_data['Close'].iloc[-2]
             change = round(((c_now - c_pre) / c_pre) * 100, 2)
             vol_ratio = round(t_data['Volume'].iloc[-1] / t_data['Volume'].iloc[:-1].mean(), 2)
@@ -78,11 +77,10 @@ def fetch_live_data(tickers_with_names, l_chg=0, l_vol=0):
         except: continue
     return pd.DataFrame(results)
 
-# --- 3. 介面導航 ---
+# --- 3. 介面與導航 ---
 st.sidebar.title("🚀 股市導航選單")
 page = st.sidebar.radio("請選擇頁面：", ["全市場分組掃描", "我的關注清單"])
 
-# --- 頁面一：全市場分組掃描 ---
 if page == "全市場分組掃描":
     st.header("⚖️ 台股全市場精確篩選系統")
     tickers = get_cleaned_tickers()
@@ -106,17 +104,17 @@ if page == "全市場分組掃描":
         if not df.empty:
             edit_df = st.data_editor(df, hide_index=True, use_container_width=True, key="editor")
             if st.button("➕ 同步選中項目至雲端清單"):
-                if 'watchlist' not in st.session_state: st.session_state['watchlist'] = []
                 to_add = edit_df[edit_df["選取"] == True]
-                for _, r in to_add.iterrows():
-                    item = f"{r['股票代號']},{r['名稱']}"
-                    if item not in st.session_state['watchlist']: st.session_state['watchlist'].append(item)
-                if sync_to_sheets(st.session_state['watchlist']):
-                    st.success("✅ 已同步至雲端！")
-        else:
-            st.warning("查無符合條件的股票。")
+                new_items = [f"{r['股票代號']},{r['名稱']}" for _, r in to_add.iterrows()]
+                # 從雲端獲取現有清單進行合併
+                try:
+                    conn = st.connection("gsheets", type=GSheetsConnection)
+                    df_cloud = conn.read(worksheet="Sheet1", ttl="0")
+                    existing = df_cloud["ticker_item"].dropna().tolist() if not df_cloud.empty else []
+                    updated = list(set(existing + new_items))
+                    if sync_to_sheets(updated): st.success("✅ 已同步至雲端！")
+                except: st.error("連線試算表失敗")
 
-# --- 頁面二：我的關注清單 ---
 elif page == "我的關注清單":
     st.header("⭐ 我的雲端關注清單")
     if st.button("🔄 即時更新數據"):
@@ -129,16 +127,18 @@ elif page == "我的關注清單":
         watchlist = df_cloud["ticker_item"].dropna().tolist() if not df_cloud.empty else []
         
         if watchlist:
-            live_df = fetch_live_data(watchlist) # 顯示台泥、精金等標的數據
+            live_df = fetch_live_data(watchlist)
             st.info("💡 提示：點擊下方表格選中股票後，再點擊下方按鈕即可彈出 KD 線圖。")
-            event = st.dataframe(live_df, on_select="rerun", selection_mode="single_row", use_container_width=True, hide_index=True)
+            
+            # 修正關鍵：將 single_row 改為 single-row (橫線)
+            event = st.dataframe(live_df, on_select="rerun", selection_mode="single-row", use_container_width=True, hide_index=True)
             
             if event.selection.rows:
                 idx = event.selection.rows[0]
                 row = live_df.iloc[idx]
-                if st.button(f"📊 彈出 {row['名稱']} KD 視窗"):
+                if st.button(f"📊 彈出 {row['名稱']} ({row['股票代號']}) KD 視窗"):
                     show_kd_dialog(row['股票代號'], row['名稱'])
         else:
-            st.info("目前清單是空的。")
+            st.info("清單目前是空的。")
     except Exception as e:
         st.error(f"連線雲端失敗：{e}")
