@@ -6,26 +6,27 @@ from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 
 # --- 1. 初始化與環境設定 ---
-st.set_page_config(layout="wide", page_title="專業行動分析站")
+st.set_page_config(layout="wide", page_title="行動分析站-旗艦版")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
 # --- 2. 核心計算函數 ---
 def calculate_metrics(df, total_shares):
-    """計算漲幅、量比與換手率"""
-    vol_col = 'Trading_Volume' 
+    """
+    計算換手率公式：
+    $$Turnover\ Rate = \frac{Trading\ Volume}{Total\ Shares} \times 100\%$$
+    """
+    vol_col = 'Trading_Volume'
     if vol_col not in df.columns or len(df) < 5: return None
     
     close_t = df['close'].iloc[-1]
     close_y = df['close'].iloc[-2]
     change_pct = ((close_t - close_y) / close_y) * 100
     
-    # 量比：今日成交量 / 前5日平均量
     avg_vol_5d = df[vol_col].iloc[-6:-1].mean()
     vol_ratio = df[vol_col].iloc[-1] / avg_vol_5d if avg_vol_5d > 0 else 0
     
-    # 換手率：(今日成交股數 / 總發行股數) * 100
-    # 注意：FinMind 兩邊單位都是「股」，直接相除即可
+    # 換手率計算：成交股數 / 總發行股數
     turnover = (df[vol_col].iloc[-1] / total_shares) * 100 if total_shares > 0 else 0
     
     return {"price": close_t, "change": change_pct, "vol_ratio": vol_ratio, "turnover": turnover}
@@ -57,7 +58,7 @@ def show_kd_dialog(stock_id, name):
         fig.update_layout(height=350, margin=dict(l=0,r=0,t=10,b=0), yaxis=dict(range=[0,100]))
         st.plotly_chart(fig, use_container_width=True)
 
-# --- 3. 側邊欄控制 ---
+# --- 3. 側邊欄與資料預載 ---
 st.sidebar.title("⚙️ 控制面板")
 if st.sidebar.button("🔄 刷新全部數據"):
     st.cache_data.clear()
@@ -75,9 +76,10 @@ try:
     watchlist = raw.iloc[:, :2].copy()
     watchlist.columns = ["股票代號", "名稱"]
 except:
-    st.info("請從左側新增股票。")
+    st.info("請新增股票。")
     st.stop()
 
+# 遍歷關注清單
 for _, row in watchlist.iterrows():
     sid_full = str(row['股票代號'])
     sid = sid_full.split('.')[0].strip()
@@ -90,16 +92,14 @@ for _, row in watchlist.iterrows():
             df_daily = dl.taiwan_stock_daily(stock_id=sid, start_date=(datetime.now()-timedelta(15)).strftime('%Y-%m-%d'))
             
             if df_daily is not None and not df_daily.empty:
-                # --- 【關鍵修正】獲取總發行股數 (換手率分母) ---
+                # --- 配合程式 1 的簡單抓取方式：從財報抓取股本 ---
                 try:
-                    # 改從「股東持股分級表」抓取，這是最準確的股數來源
-                    poll_df = dl.taiwan_stock_shares_poll(stock_id=sid, start_date=(datetime.now()-timedelta(45)).strftime('%Y-%m-%d'))
-                    if not poll_df.empty:
-                        # 抓取最後一個交易日的資料並加總所有分級股數
-                        last_p_date = poll_df['date'].max()
-                        total_shares = poll_df[poll_df['date'] == last_p_date]['number_of_shares'].sum()
-                    else:
-                        total_shares = 0
+                    # 抓取最近一年的財報，並鎖定「普通股股本」
+                    fs = dl.taiwan_stock_financial_statement(stock_id=sid, start_date=(datetime.now()-timedelta(365)).strftime('%Y-%m-%d'))
+                    # 核心修正：FinMind 的股本名稱通常為 Ordinary_share_capital_per_value
+                    capital_row = fs[fs['type'].str.contains('Ordinary_share_capital', na=False, case=False)]
+                    # 總股數 = 股本金額 / 10元面額
+                    total_shares = (capital_row['value'].iloc[-1] / 10) if not capital_row.empty else 0
                 except:
                     total_shares = 0
                 
@@ -110,9 +110,9 @@ for _, row in watchlist.iterrows():
                     c1.markdown(f"價: **{m['price']}**")
                     c2.markdown(f"幅: <span style='color:{color}'>{m['change']:.2f}%</span>", unsafe_allow_html=True)
                     c3.markdown(f"量比: **{m['vol_ratio']:.1f}**")
-                    c4.markdown(f"換手: **{m['turnover']:.2f}%**") # 現在換手率應有數值
+                    c4.markdown(f"換手: **{m['turnover']:.2f}%**")
                 
-                # --- 法人籌碼 (鎖定 image_24d581.png 診斷出的英文名稱) ---
+                # --- 法人籌碼 (使用診斷出的英文標籤) ---
                 inst_df = dl.taiwan_stock_institutional_investors(stock_id=sid, start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d'))
                 if inst_df is not None and not inst_df.empty:
                     last_d = inst_df['date'].max()
@@ -120,12 +120,7 @@ for _, row in watchlist.iterrows():
                     today_inst['buy'] = pd.to_numeric(today_inst['buy'], errors='coerce')
                     today_inst['sell'] = pd.to_numeric(today_inst['sell'], errors='coerce')
                     
-                    # 根據診斷截圖鎖定名稱
-                    mapping = {
-                        "外資": ["Foreign_Investor"],
-                        "投信": ["Investment_Trust"],
-                        "自營": ["Dealer_self"]
-                    }
+                    mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
                     chips = []
                     total_net = 0
                     for label, kw in mapping.items():
