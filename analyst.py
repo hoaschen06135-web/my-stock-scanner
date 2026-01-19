@@ -27,7 +27,8 @@ def get_fm_chips(sid):
     dl = DataLoader()
     try:
         dl.login(token=TOKEN)
-        time.sleep(1) # 保護延遲，防止 503 錯誤
+        # 增加保護延遲，防止 503 錯誤
+        time.sleep(1) 
         df = dl.taiwan_stock_institutional_investors(
             stock_id=sid, 
             start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d')
@@ -37,7 +38,7 @@ def get_fm_chips(sid):
         return pd.DataFrame()
 
 # 4. 主介面邏輯
-st.title("🚀 專業關注清單 (雙核心控制版)")
+st.title("🚀 專業關注清單 (雙按鈕獨立版)")
 
 try:
     raw = conn.read().dropna(how='all')
@@ -47,7 +48,7 @@ except:
     st.info("清單為空。")
     st.stop()
 
-# 遍歷每支股票
+# 遍歷每支股票顯示按鈕
 for _, row in watchlist.iterrows():
     sid_full = str(row['股票代號']).strip()
     sid = sid_full.split('.')[0]
@@ -60,46 +61,39 @@ for _, row in watchlist.iterrows():
         # 建立兩個按鈕的欄位
         col_btn1, col_btn2 = st.columns(2)
         
-        # 按鈕一：Yahoo 行情
+        # 按鈕一：Yahoo 行情 (免 API 額度)
         with col_btn1:
-            if st.button(f"🔍 檢查行情與換手率", key=f"y_btn_{sid}"):
-                with st.spinner("Yahoo 數據加載中..."):
-                    hist, shares = get_yahoo_info(sid_tw)
-                    if not hist.empty:
-                        last_p = round(hist['Close'].iloc[-1], 2)
-                        prev_p = hist['Close'].iloc[-2]
-                        chg = ((last_p - prev_p) / prev_p) * 100
-                        vol = hist['Volume'].iloc[-1]
-                        # 換手率計算 (股數分母由 Yahoo 提供)
-                        turnover = (vol / shares) * 100 if shares > 0 else 0
-                        
-                        color = "red" if chg > 0 else "green"
-                        st.success(f"現價: {last_p} | 漲幅: {chg:.2f}%")
-                        st.info(f"今日換手率: {turnover:.2f}%")
-                    else:
-                        st.error("無法取得 Yahoo 行情")
+            if st.button(f"🔍 點我更新：行情與換手率", key=f"y_btn_{sid}"):
+                hist, shares = get_yahoo_info(sid_tw)
+                if not hist.empty:
+                    last_p = round(hist['Close'].iloc[-1], 2)
+                    chg = ((last_p - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
+                    vol = hist['Volume'].iloc[-1]
+                    # 使用 Yahoo 股本計算精確換手率
+                    turnover = (vol / shares) * 100 if shares > 0 else 0
+                    
+                    color = "red" if chg > 0 else "green"
+                    st.success(f"現價: {last_p} | 漲幅: {chg:.2f}%")
+                    st.info(f"今日換手率: {turnover:.2f}%")
+                else:
+                    st.error("無法取得 Yahoo 行情，請稍後再試。")
 
-        # 按鈕二：FinMind 法人籌碼
+        # 按鈕二：FinMind 法人籌碼 (消耗 API 額度)
         with col_btn2:
-            if st.button(f"📊 讀取三大法人張數", key=f"fm_btn_{sid}"):
-                with st.spinner("FinMind 籌碼計算中..."):
-                    chips = get_fm_chips(sid)
-                    if not chips.empty:
-                        last_d = chips['date'].max()
-                        today = chips[chips['date'] == last_d]
-                        mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
-                        total_net = 0
-                        results = []
-                        for label, kw in mapping.items():
-                            r = today[today['name'].isin(kw)]
-                            if not r.empty:
-                                n = int((pd.to_numeric(r['buy']).sum() - pd.to_numeric(r['sell']).sum()) // 1000)
-                                total_net += n
-                                c = "red" if n > 0 else "green"
-                                results.append(f"{label}:<span style='color:{c}'>{n}張</span>")
-                        
-                        t_c = "red" if total_net > 0 else "green"
-                        st.markdown(f"🗓️ **{last_d}** | 合計: <span style='color:{t_c}'>{total_net}張</span>", unsafe_allow_html=True)
-                        st.markdown(f"<small>{' | '.join(results)}</small>", unsafe_allow_html=True)
-                    else:
-                        st.warning("API 額度已滿或頻率過快")
+            if st.button(f"📊 點我更新：三大法人籌碼", key=f"fm_btn_{sid}"):
+                chips = get_fm_chips(sid)
+                if not chips.empty:
+                    last_d = chips['date'].max()
+                    today = chips[chips['date'] == last_d]
+                    # 鎖定您的帳號環境診斷出的標籤
+                    mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
+                    results = []
+                    for label, kw in mapping.items():
+                        r = today[today['name'].isin(kw)]
+                        if not r.empty:
+                            n = int((pd.to_numeric(r['buy']).sum() - pd.to_numeric(r['sell']).sum()) // 1000)
+                            c = "red" if n > 0 else "green"
+                            results.append(f"{label}:<span style='color:{c}'>{n}張</span>")
+                    st.markdown(f"🗓️ {last_d} | {' '.join(results)}", unsafe_allow_html=True)
+                else:
+                    st.warning("籌碼額度已滿或頻率過快，請稍等 1 分鐘再按")
