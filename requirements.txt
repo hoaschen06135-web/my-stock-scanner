@@ -1,10 +1,5 @@
 streamlit
-yfinance
 pandas
-requests
-lxml
-urllib3
-plotly
+yfinance
 FinMind
-st-gsheets-connection
-tqdm
+streamlit-gsheets-connection
