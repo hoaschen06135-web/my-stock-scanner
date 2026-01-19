@@ -8,11 +8,11 @@ from io import StringIO
 import math
 import urllib3
 
-# 基礎設定
+# 基礎環境與頁面設定
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 st.set_page_config(layout="wide", page_title="台股精確篩選系統")
 
-# --- 1. KD 指標計算與彈出視窗 ---
+# --- 1. 技術指標與彈出視窗 ---
 def calculate_kd(df):
     """計算 KD 指標 (9, 3, 3)"""
     low_min = df['Low'].rolling(window=9).min()
@@ -32,64 +32,94 @@ def show_kd_dialog(ticker, name):
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=hist.index, y=hist['K'], name='K值', line=dict(color='#1f77b4')))
             fig.add_trace(go.Scatter(x=hist.index, y=hist['D'], name='D值', line=dict(color='#ff7f0e')))
-            fig.add_hline(y=80, line_dash="dash", line_color="red", annotation_text="超買區")
-            fig.add_hline(y=20, line_dash="dash", line_color="green", annotation_text="超賣區")
+            fig.add_hline(y=80, line_dash="dash", line_color="red")
+            fig.add_hline(y=20, line_dash="dash", line_color="green")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.error("無法抓取歷史數據")
+            st.error("無法讀取歷史數據")
 
-# --- 2. 核心數據獲取邏輯 ---
-def fetch_live_data(tickers_with_names):
+# --- 2. 核心數據處理函數 ---
+def sync_to_sheets(watchlist):
+    try:
+        conn = st.connection("gsheets", type=GSheetsConnection)
+        new_df = pd.DataFrame({"ticker_item": watchlist})
+        conn.update(worksheet="Sheet1", data=new_df)
+        return True
+    except Exception as e:
+        st.error(f"同步失敗：{e}")
+        return False
+
+@st.cache_data(ttl=3600)
+def get_cleaned_tickers():
+    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+    res = requests.get(url, verify=False)
+    df = pd.read_html(StringIO(res.text))[0].iloc[1:]
+    return [f"{str(val).split('　')[0]}.TW,{str(val).split('　')[1]}" for val in df[0] 
+            if '　' in str(val) and str(val).split('　')[0].isdigit()]
+
+def fetch_live_data(tickers_with_names, l_chg=0, l_vol=0):
     if not tickers_with_names: return pd.DataFrame()
     mapping = {t.split(',')[0]: t.split(',')[1] for t in tickers_with_names}
-    
-    # 抓取 6 天數據以確保能計算量比
+    # 抓取 6 天數據以計算量比
     data = yf.download(list(mapping.keys()), period="6d", group_by='ticker', progress=False)
+    
     results = []
     for t in mapping.keys():
         try:
             t_data = data[t] if len(mapping) > 1 else data
             if t_data.empty: continue
-            
             c_now, c_pre = t_data['Close'].iloc[-1], t_data['Close'].iloc[-2]
             change = round(((c_now - c_pre) / c_pre) * 100, 2)
             vol_ratio = round(t_data['Volume'].iloc[-1] / t_data['Volume'].iloc[:-1].mean(), 2)
             
-            tk = yf.Ticker(t)
-            shares = tk.info.get('sharesOutstanding', 1)
-            turnover = round((t_data['Volume'].iloc[-1] / shares) * 100, 2)
-            mcap = f"{round(tk.info.get('marketCap', 0)/1e8, 2)} 億"
-
-            results.append({
-                "選取": False, "股票代號": t, "名稱": mapping[t], 
-                "漲幅(%)": change, "量比": vol_ratio, 
-                "換手率(%)": turnover, "流通市值": mcap, "最後價格": round(c_now, 2)
-            })
+            if change >= l_chg and vol_ratio >= l_vol:
+                results.append({"選取": False, "股票代號": t, "名稱": mapping[t], 
+                                "漲幅(%)": change, "量比": vol_ratio, "目前價格": round(c_now, 2)})
         except: continue
     return pd.DataFrame(results)
 
-# --- 3. 頁面導航 ---
+# --- 3. 介面導航 ---
 st.sidebar.title("🚀 股市導航選單")
 page = st.sidebar.radio("請選擇頁面：", ["全市場分組掃描", "我的關注清單"])
 
-# --- 頁面一：全市場分組掃描 (含單一搜尋) ---
+# --- 頁面一：全市場分組掃描 ---
 if page == "全市場分組掃描":
-    st.header("⚖️ 台股全市場篩選系統")
-    
+    st.header("⚖️ 台股全市場精確篩選系統")
+    tickers = get_cleaned_tickers()
     single_search = st.sidebar.text_input("🔍 單一股票搜尋 (如: 2330)")
+    sel_g = st.sidebar.selectbox("1. 選擇掃描群組", [f"第 {i+1} 組" for i in range(math.ceil(len(tickers)/100))])
+    
+    l_chg = st.sidebar.number_input("漲幅下限 (%)", value=0.0)
+    l_vol = st.sidebar.number_input("量比下限", value=1.0)
     
     if st.button("🚀 開始掃描"):
-        # 這裡根據您的需求進行掃描邏輯...
-        # ...
-        st.session_state['scan_res'] = fetch_live_data([...]) # 填入目標代號
-        st.rerun()
+        with st.spinner("抓取數據中..."):
+            if single_search.strip():
+                code = f"{single_search.strip()}.TW" if ".TW" not in single_search.upper() else single_search.strip()
+                target = [f"{code},搜尋結果"]
+            else:
+                target = tickers[int(sel_g.split(' ')[1])*100-100 : int(sel_g.split(' ')[1])*100]
+            st.session_state['scan_res'] = fetch_live_data(target, l_chg, l_vol)
 
-# --- 頁面二：我的關注清單 (含即時更新與 KD 彈窗) ---
+    if 'scan_res' in st.session_state:
+        df = st.session_state['scan_res']
+        if not df.empty:
+            edit_df = st.data_editor(df, hide_index=True, use_container_width=True, key="editor")
+            if st.button("➕ 同步選中項目至雲端清單"):
+                if 'watchlist' not in st.session_state: st.session_state['watchlist'] = []
+                to_add = edit_df[edit_df["選取"] == True]
+                for _, r in to_add.iterrows():
+                    item = f"{r['股票代號']},{r['名稱']}"
+                    if item not in st.session_state['watchlist']: st.session_state['watchlist'].append(item)
+                if sync_to_sheets(st.session_state['watchlist']):
+                    st.success("✅ 已同步至雲端！")
+        else:
+            st.warning("查無符合條件的股票。")
+
+# --- 頁面二：我的關注清單 ---
 elif page == "我的關注清單":
     st.header("⭐ 我的雲端關注清單")
-    
-    # 即時更新按鈕
-    if st.button("🔄 刷新即時數據與篩選指標"):
+    if st.button("🔄 即時更新數據"):
         st.cache_data.clear()
         st.rerun()
 
@@ -99,20 +129,16 @@ elif page == "我的關注清單":
         watchlist = df_cloud["ticker_item"].dropna().tolist() if not df_cloud.empty else []
         
         if watchlist:
-            with st.spinner("更新數據中..."):
-                live_df = fetch_live_data(watchlist) # 同步顯示台泥、精金等標的數據
-            
-            st.info("💡 提示：點擊下方表格選中股票後，再點擊下方按鈕即可彈出 KD 技術線圖。")
-            
-            # 解決 WidthError，確保表格寬度正確
+            live_df = fetch_live_data(watchlist) # 顯示台泥、精金等標的數據
+            st.info("💡 提示：點擊下方表格選中股票後，再點擊下方按鈕即可彈出 KD 線圖。")
             event = st.dataframe(live_df, on_select="rerun", selection_mode="single_row", use_container_width=True, hide_index=True)
             
             if event.selection.rows:
                 idx = event.selection.rows[0]
                 row = live_df.iloc[idx]
-                if st.button(f"📊 彈出 {row['名稱']} ({row['股票代號']}) KD 視窗"):
+                if st.button(f"📊 彈出 {row['名稱']} KD 視窗"):
                     show_kd_dialog(row['股票代號'], row['名稱'])
         else:
-            st.info("目前清單是空的，請先去掃描並加入股票。")
+            st.info("目前清單是空的。")
     except Exception as e:
-        st.error(f"連線試算表出錯：{e}")
+        st.error(f"連線雲端失敗：{e}")
