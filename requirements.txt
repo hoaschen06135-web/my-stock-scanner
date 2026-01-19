@@ -7,3 +7,4 @@ urllib3
 plotly
 FinMind
 st-gsheets-connection
+tqdm
