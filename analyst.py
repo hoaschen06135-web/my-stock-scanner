@@ -4,46 +4,64 @@ import plotly.graph_objects as go
 from streamlit_gsheets import GSheetsConnection
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
+import time
 
 # --- 1. 初始化與環境設定 ---
-st.set_page_config(layout="wide", page_title="行動分析站-旗艦版")
+st.set_page_config(layout="wide", page_title="專業行動分析站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
-# --- 2. 核心計算函數 ---
+# --- 2. 緩存數據抓取 (節省 API 額度並防止 KeyError: 'data') ---
+@st.cache_data(ttl=3600)
+def fetch_data(stock_id, dataset, start_date):
+    """封裝 API 請求，加入錯誤處理與重試機制"""
+    dl = DataLoader()
+    try: dl.login(token=TOKEN)
+    except: pass
+    
+    # 確保代號為純數字
+    pure_id = str(stock_id).split('.')[0].replace(' ', '').strip()
+    
+    try:
+        # 呼叫 FinMind 原始 API
+        if dataset == "Daily":
+            df = dl.taiwan_stock_daily(stock_id=pure_id, start_date=start_date)
+        elif dataset == "Inst":
+            df = dl.taiwan_stock_institutional_investors(stock_id=pure_id, start_date=start_date)
+        elif dataset == "Poll":
+            df = dl.taiwan_stock_shares_poll(stock_id=pure_id, start_date=start_date)
+        
+        if df is not None and not df.empty:
+            return df
+    except:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+# --- 3. 核心計算函數 ---
 def calculate_metrics(df, total_shares):
     """計算漲幅、量比與換手率"""
-    # 自動識別成交量欄位名稱，避免 KeyError
-    vol_col = next((c for c in df.columns if 'volume' in c.lower()), None)
-    if not vol_col or len(df) < 2: return None
+    vol_col = 'Trading_Volume'
+    if vol_col not in df.columns or len(df) < 5: return None
     
     close_t = df['close'].iloc[-1]
     close_y = df['close'].iloc[-2]
     change_pct = ((close_t - close_y) / close_y) * 100
     
-    # 量比：今日成交量 / 前5日平均量 (排除今日)
-    if len(df) >= 6:
-        avg_vol_5d = df[vol_col].iloc[-6:-1].mean()
-        vol_ratio = df[vol_col].iloc[-1] / avg_vol_5d if avg_vol_5d > 0 else 0
-    else:
-        vol_ratio = 0
+    avg_vol_5d = df[vol_col].iloc[-6:-1].mean()
+    vol_ratio = df[vol_col].iloc[-1] / avg_vol_5d if avg_vol_5d > 0 else 0
     
-    # 換手率公式
+    # 換手率公式：(今日成交股數 / 總發行股數) * 100%
     turnover = (df[vol_col].iloc[-1] / total_shares) * 100 if total_shares > 0 else 0
     
     return {"price": close_t, "change": change_pct, "vol_ratio": vol_ratio, "turnover": turnover}
 
-# --- 3. 側邊欄控制 ---
+# --- 4. 側邊欄與更新控制 ---
 st.sidebar.title("⚙️ 控制面板")
-if st.sidebar.button("🔄 刷新全部數據"):
+if st.sidebar.button("🔄 強制刷新雲端數據"):
     st.cache_data.clear()
     st.rerun()
 
-dl = DataLoader()
-try: dl.login(token=TOKEN)
-except: pass
-
-# --- 4. 主介面 ---
+# --- 5. 主介面 ---
 st.title("🚀 專業關注清單監控")
 
 try:
@@ -51,14 +69,13 @@ try:
     watchlist = raw.iloc[:, :2].copy()
     watchlist.columns = ["股票代號", "名稱"]
 except:
-    st.info("請從左側新增股票。")
+    st.info("清單為空。")
     st.stop()
 
-# 診斷資訊存放
+# 診斷日誌
 diag_logs = []
 
 for _, row in watchlist.iterrows():
-    # 強化代號清理邏輯，解決 KeyError
     raw_sid = str(row['股票代號'])
     pure_id = raw_sid.split('.')[0].replace(' ', '').strip()
     sname = str(row['名稱']).strip()
@@ -69,19 +86,15 @@ for _, row in watchlist.iterrows():
             st.markdown(f"**{sname}** `{pure_id}.TW`")
             
             # 抓取日 K 資料
-            df_daily = dl.taiwan_stock_daily(stock_id=pure_id, start_date=(datetime.now()-timedelta(15)).strftime('%Y-%m-%d'))
+            df_daily = fetch_data(pure_id, "Daily", (datetime.now()-timedelta(15)).strftime('%Y-%m-%d'))
             
-            if df_daily is not None and not df_daily.empty:
-                # --- 多重備援抓取總股數 (換手率核心) ---
+            if not df_daily.empty:
+                # --- 多重補齊總股數 (解決換手率 0%) ---
                 total_shares = 0
-                try:
-                    # 優先從「股東持股分級表」抓取最新總股數
-                    poll = dl.taiwan_stock_shares_poll(stock_id=pure_id, start_date=(datetime.now()-timedelta(45)).strftime('%Y-%m-%d'))
-                    if not poll.empty:
-                        last_p = poll['date'].max()
-                        total_shares = poll[poll['date'] == last_p]['number_of_shares'].sum()
-                except Exception as e:
-                    diag_logs.append(f"{pure_id} 股數抓取失敗: {str(e)}")
+                poll_df = fetch_data(pure_id, "Poll", (datetime.now()-timedelta(45)).strftime('%Y-%m-%d'))
+                if not poll_df.empty:
+                    last_p = poll_df['date'].max()
+                    total_shares = poll_df[poll_df['date'] == last_p]['number_of_shares'].sum()
                 
                 m = calculate_metrics(df_daily, total_shares)
                 if m:
@@ -92,13 +105,12 @@ for _, row in watchlist.iterrows():
                     c3.markdown(f"量比: **{m['vol_ratio']:.1f}**")
                     c4.markdown(f"換手: **{m['turnover']:.2f}%**")
                 
-                # --- 法人籌碼 (使用 image_24d581.png 診斷出的英文標籤) ---
-                inst_df = dl.taiwan_stock_institutional_investors(stock_id=pure_id, start_date=(datetime.now()-timedelta(10)).strftime('%Y-%m-%d'))
-                if inst_df is not None and not inst_df.empty:
+                # --- 法人籌碼 (使用診斷後的精確標籤) ---
+                inst_df = fetch_data(pure_id, "Inst", (datetime.now()-timedelta(10)).strftime('%Y-%m-%d'))
+                if not inst_df.empty:
                     last_d = inst_df['date'].max()
                     today_inst = inst_df[inst_df['date'] == last_d].copy()
                     
-                    # 根據除錯截圖鎖定英文名稱
                     mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
                     chips = []
                     total_net = 0
@@ -113,10 +125,12 @@ for _, row in watchlist.iterrows():
                     t_color = "red" if total_net > 0 else "green" if total_net < 0 else "gray"
                     st.markdown(f"<small>🗓️ {last_d} | 合計: <span style='color:{t_color}'>{total_net}張</span> | {' '.join(chips)}</small>", unsafe_allow_html=True)
             else:
-                st.warning(f"無法取得 {pure_id} 的報價數據，請檢查代號。")
+                st.warning(f"無法取得 {pure_id} 數據，可能是 API 額度用盡或頻率過快。")
+                diag_logs.append(f"Stock {pure_id}: Daily data empty.")
 
-# --- 5. 系統診斷報告 ---
+# --- 6. 系統診斷報告 ---
 if diag_logs:
-    with st.expander("🛠️ 系統診斷報告 (若換手率仍為 0 請截圖此處)"):
+    with st.expander("🛠️ 系統診斷中心"):
         for log in diag_logs:
             st.write(log)
+        st.write("提示：您的 API 額度為每小時 300 次，若清單股票過多，請降低重新整理頻率。")
