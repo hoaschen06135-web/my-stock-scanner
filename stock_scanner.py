@@ -7,6 +7,7 @@ import os
 import time
 import urllib3
 import plotly.graph_objects as go
+from io import StringIO # 修正 read_html 棄用問題
 
 # --- 1. 環境設定與初始化 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -18,7 +19,7 @@ if 'watchlist' not in st.session_state:
 # --- 2. 數據抓取與精確篩選函數 ---
 @st.cache_data(ttl=3600)
 def get_cleaned_tickers():
-    """強制過濾雜訊，僅保留 4 位數純數字標的，解決搜尋不到資料的問題"""
+    """強制過濾 $ 符號雜訊，僅保留 4 位數純數字標的，恢復搜尋功能"""
     urls = [("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", ".TW"),
             ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO")]
     ticker_data = []
@@ -26,13 +27,13 @@ def get_cleaned_tickers():
     for url, suffix in urls:
         try:
             res = requests.get(url, headers=headers, verify=False, timeout=10)
-            # 解決 read_html 警告
-            df = pd.read_html(requests.utils.io.StringIO(res.text))[0].iloc[1:]
+            # 使用 StringIO 包裝 HTML，解決 image_0844c5.png 中的棄用警告
+            df = pd.read_html(StringIO(res.text))[0].iloc[1:]
             for val in df[0]:
                 if '　' in str(val):
                     parts = val.split('　')
                     code, name = parts[0].strip(), parts[1].strip()
-                    # 關鍵：排除 $ 開頭的無效標的，僅保留 4 位數字
+                    # 關鍵：排除權證代號，只留 4 位數字，防止 Yahoo 封鎖 IP
                     if code.isdigit() and len(code) == 4:
                         ticker_data.append(f"{code}{suffix},{name}")
         except: continue
@@ -61,7 +62,7 @@ def fetch_stock_data(tickers_with_names, low_chg=0.0, high_chg=10.0, low_vol=0.0
             turnover = round((t_data['Volume'].iloc[-1] / info.get('sharesOutstanding', 1)) * 100, 2)
             mcap = f"{round(info.get('marketCap', 0) / 1e8, 2)} 億"
 
-            # 根據參數過濾
+            # 根據側邊欄手動輸入的數值進行篩選
             if not (low_chg <= change <= high_chg): continue
             if not (low_vol <= vol_ratio <= high_vol): continue
             if not (low_turn <= turnover <= high_turn): continue
@@ -73,10 +74,10 @@ def fetch_stock_data(tickers_with_names, low_chg=0.0, high_chg=10.0, low_vol=0.0
         except: continue
     return pd.DataFrame(results)
 
-# --- 3. KD 線彈窗 (修復 ValueError) ---
+# --- 3. KD 線彈窗 (解決 ValueError) ---
 @st.dialog("個股 KD 指標分析")
 def show_kd_window(item):
-    """修正 image_07c11f.png 中的賦值錯誤，改用穩定 List 運算"""
+    """修復 image_07c11f.png 中的數據賦值錯誤"""
     code, name = item.split(',')[0], item.split(',')[1]
     df = yf.download(code, period="1mo", progress=False)
     if not df.empty and len(df) >= 9:
@@ -93,12 +94,12 @@ def show_kd_window(item):
         fig.add_trace(go.Scatter(x=df.index, y=k, name='K線', line=dict(color='blue')))
         fig.add_trace(go.Scatter(x=df.index, y=d, name='D線', line=dict(color='orange')))
         fig.update_layout(yaxis=dict(range=[0, 100]), height=350, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig, width="full") # 更新語法
+        # 修正寬度報錯：使用正確的參數
+        st.plotly_chart(fig, use_container_width=True)
     if st.button("關閉"): st.rerun()
 
-# --- 4. 側邊欄配置 (位置優化) ---
+# --- 4. 側邊欄配置 (群組置頂) ---
 st.sidebar.title("🚀 股市導航選單")
-# 優先定義 page 以解決 NameError
 page = st.sidebar.radio("請選擇頁面：", ["全市場分組掃描", "我的關注清單"])
 st.sidebar.markdown("---")
 
@@ -109,12 +110,11 @@ if page == "全市場分組掃描":
     num_p_g = 100
     num_groups = math.ceil(len(tickers) / num_p_g)
     
-    # --- 群組選擇置頂 ---
+    # --- 群組選擇位置移至上方 ---
     st.sidebar.subheader("📦 選擇掃描群組")
     sel_g = st.sidebar.selectbox("每組 100 支標的", [f"第 {i+1} 組" for i in range(num_groups)])
     st.sidebar.markdown("---")
     
-    # --- 參數設定 ---
     st.sidebar.subheader("🔍 篩選參數設定")
     low_chg = st.sidebar.number_input("漲幅下限 (%)", value=3.0, step=0.1)
     high_chg = st.sidebar.number_input("漲幅上限 (%)", value=5.0, step=0.1)
@@ -135,8 +135,8 @@ if page == "全市場分組掃描":
         df = st.session_state['scan_res']
         st.subheader(f"篩選結果 (符合多重條件共 {len(df)} 支標的)")
         if not df.empty:
-            # 更新語法：使用 width="full"
-            edit_df = st.data_editor(df, hide_index=True, width="full", key="scan_editor")
+            # 解決 image_0848e1.png 寬度報錯：將 width="full" 改回 use_container_width=True
+            edit_df = st.data_editor(df, hide_index=True, use_container_width=True, key="scan_editor")
             if st.button("➕ 加入關注清單"):
                 to_add = edit_df[edit_df["選取"] == True]
                 for _, r in to_add.iterrows():
