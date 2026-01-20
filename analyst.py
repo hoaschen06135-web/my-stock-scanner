@@ -8,25 +8,24 @@ from datetime import datetime, timedelta
 import time
 import random
 import plotly.graph_objects as go
-import urllib3 # 用於忽略 SSL 警告
+import urllib3
 
-# --- 1. 初始化環境 ---
-st.set_page_config(layout="wide", page_title="法人鎖碼監控站")
+# --- 1. 初始化 ---
+st.set_page_config(layout="wide", page_title="全方位監控站")
 conn = st.connection("gsheets", type=GSheetsConnection)
-TOKEN = st.secrets.get("FINMIND_TOKEN", "") 
+TOKEN = st.secrets.get("FINMIND_TOKEN", "")
 
 if 'stock_memory' not in st.session_state:
     st.session_state.stock_memory = {}
 
-# 模擬真實瀏覽器的 Headers (避開證交所擋爬蟲)
+# 模擬 Headers
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
 }
 
-# --- 2. 核心計算邏輯 ---
+# --- 2. 計算函式 ---
 def calculate_kdj(df):
-    """引擎 A：本地計算 KD"""
     try:
         low_9 = df['Low'].rolling(window=9).min()
         high_9 = df['High'].rolling(window=9).max()
@@ -37,9 +36,8 @@ def calculate_kdj(df):
     except: return None
 
 def get_streak(df):
-    """計算法人連續買超天數"""
+    """計算法人連買天數"""
     if not isinstance(df, pd.DataFrame) or df.empty: return 0
-    # 合計三大法人每日買賣超
     daily = df.groupby('date').apply(lambda x: (pd.to_numeric(x['buy']).sum() - pd.to_numeric(x['sell']).sum())).sort_index(ascending=False)
     streak = 0
     for val in daily:
@@ -47,101 +45,127 @@ def get_streak(df):
         else: break
     return streak
 
-# --- 3. 引擎 B：證交所 OpenAPI (已修復 SSL 與 NameError) ---
+# --- 3. 引擎 B：證交所 OpenAPI (SSL 修復版) ---
 @st.cache_data(ttl=3600)
 def fetch_twse_data():
-    """直連證交所 JSON API (強制跳過 SSL 驗證)"""
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBYK_ALL"
-        
-        # [修復] 忽略不安全連線的警告
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        # [修復] verify=False 跳過 SSL 檢查，解決 image_4e50eb.png 報錯
         res = requests.get(url, headers=HEADERS, timeout=15, verify=False)
-        
         if res.status_code == 200:
             return pd.DataFrame(res.json()).set_index('Code')
-        else:
-            return pd.DataFrame()
-            
-    except Exception as e:
-        st.warning(f"⚠️ 證交所數據連線異常 (已跳過): {e}")
-        return pd.DataFrame()
+        else: return pd.DataFrame()
+    except: return pd.DataFrame()
 
-# --- 4. 同步與抓取 ---
+# --- 4. 同步核心 ---
 def sync_all_data(watchlist):
     dl = DataLoader()
     if TOKEN:
         try: dl.login(token=TOKEN)
         except: pass
     
-    # A. 抓取證交所資料 (這裡會調用修復後的函式)
     twse_stats = fetch_twse_data()
-    
-    # B. 抓取 Yahoo 股價
     sids_raw = [str(x).split('.')[0].strip() for x in watchlist['股票代號']]
     sids_tw = [f"{s}.TW" for s in sids_raw]
     
     st.info(f"正在同步 {len(sids_tw)} 檔個股數據...")
     progress_bar = st.progress(0)
     
-    # 一次下載避免迴圈鎖 IP
     try:
         all_hist = yf.download(sids_tw, period='3mo', group_by='ticker', threads=True)
-    except:
-        all_hist = pd.DataFrame()
+    except: all_hist = pd.DataFrame()
 
     for i, (sid, sid_full) in enumerate(zip(sids_raw, sids_tw)):
         name = watchlist.iloc[i]['名稱']
-        report = {"name": name, "market": None, "chips": None, "twse": None, "hist": None}
+        # 初始化報告結構
+        report = {
+            "name": name, 
+            "market": None, # 包含現價、漲幅、量比、換手率、市值
+            "chips": None,  # 包含連買天數、詳細張數
+            "twse": None,   # 包含 PE, Yield
+            "hist": None    # KD 線
+        }
         
-        # 1. 解析 Yahoo
+        # --- 1. Yahoo: 價格、量比、換手率、市值 ---
         try:
-            if not all_hist.empty:
-                # 處理單檔與多檔回傳格式差異
-                if len(sids_tw) > 1:
-                    hist = all_hist[sid_full].dropna() if sid_full in all_hist else pd.DataFrame()
-                else:
-                    hist = all_hist.dropna()
+            tk = yf.Ticker(sid_full)
+            
+            # (A) 處理歷史股價與 KD
+            if len(sids_tw) > 1:
+                hist = all_hist[sid_full].dropna() if sid_full in all_hist else pd.DataFrame()
+            else:
+                hist = all_hist.dropna()
 
-                if not hist.empty:
-                    last_p = round(float(hist['Close'].iloc[-1]), 2)
-                    prev_p = round(float(hist['Close'].iloc[-2]), 2)
-                    chg = ((last_p - prev_p) / prev_p) * 100
-                    report["market"] = {"price": last_p, "change": chg}
-                    report["hist"] = calculate_kdj(hist)
+            if not hist.empty:
+                last_p = round(float(hist['Close'].iloc[-1]), 2)
+                prev_p = round(float(hist['Close'].iloc[-2]), 2)
+                chg = ((last_p - prev_p) / prev_p) * 100
+                
+                # [新增] 量比計算: 今日量 / 5日均量
+                vol_ma5 = hist['Volume'].iloc[-6:-1].mean()
+                v_ratio = hist['Volume'].iloc[-1] / vol_ma5 if vol_ma5 > 0 else 0
+                
+                # [新增] 換手率與市值 (使用 fast_info 避雷)
+                try:
+                    shares = tk.fast_info['shares']
+                    mkt_cap = last_p * shares / 100000000 # 億
+                    turnover = (hist['Volume'].iloc[-1] / shares) * 100
+                except:
+                    shares = 0; mkt_cap = 0; turnover = 0
+
+                report["market"] = {
+                    "price": last_p, "change": chg, 
+                    "v_ratio": v_ratio, 
+                    "turnover": turnover, 
+                    "mkt_cap": mkt_cap
+                }
+                report["hist"] = calculate_kdj(hist)
         except: pass
 
-        # 2. 填入證交所本益比/殖利率
+        # --- 2. 證交所: PE, Yield ---
         if sid in twse_stats.index:
             s = twse_stats.loc[sid]
             report["twse"] = {"pe": s.get('PEratio', '-'), "yield": s.get('DividendYield', '-')}
 
-        # 3. FinMind 籌碼 (防崩潰 + 隨機延遲)
+        # --- 3. FinMind: 法人詳細籌碼 ---
         try:
-            time.sleep(random.uniform(0.5, 1.5)) 
-            start_date = (datetime.now() - timedelta(40)).strftime('%Y-%m-%d')
+            time.sleep(random.uniform(0.5, 1.2))
             raw_res = dl.get_data(
                 dataset="TaiwanStockInstitutionalInvestors", 
                 data_id=sid, 
-                start_date=start_date
+                start_date=(datetime.now() - timedelta(40)).strftime('%Y-%m-%d')
             )
             
             if isinstance(raw_res, pd.DataFrame) and not raw_res.empty:
                 last_date = raw_res['date'].max()
                 today_data = raw_res[raw_res['date'] == last_date]
-                net_buy = (pd.to_numeric(today_data['buy']).sum() - pd.to_numeric(today_data['sell']).sum()) // 1000
-                report["chips"] = {"streak": get_streak(raw_res), "net": int(net_buy)}
+                
+                # [新增] 詳細法人數據拼湊
+                mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self", "Dealer"]}
+                net_total = 0; details = []
+                
+                for label, kw in mapping.items():
+                    r = today_data[today_data['name'].isin(kw)]
+                    if not r.empty:
+                        val = int((pd.to_numeric(r['buy']).sum() - pd.to_numeric(r['sell']).sum()) // 1000)
+                        net_total += val
+                        details.append(f"{label}:{val}")
+                
+                streak = get_streak(raw_res)
+                report["chips"] = {
+                    "streak": streak, 
+                    "net": net_total, 
+                    "details": " | ".join(details)
+                }
         except: pass
         
         st.session_state.stock_memory[sid] = report
         progress_bar.progress((i + 1) / len(sids_raw))
 
-    st.success("同步完成！")
+    st.success("全指標同步完成！")
 
 # --- 5. UI 呈現 ---
-st.title("🛡️ 專業級法人鎖碼監控站")
+st.title("🛡️ 全方位監控站 (旗艦版)")
 
 with st.sidebar:
     st.header("控制台")
@@ -156,7 +180,7 @@ with st.sidebar:
             st.error(f"清單讀取失敗: {e}")
 
 if st.session_state.stock_memory:
-    # 排序：優先顯示連買天數多的
+    # 排序：優先顯示連買天數
     sorted_stocks = sorted(
         st.session_state.stock_memory.items(), 
         key=lambda x: x[1]['chips']['streak'] if x[1]['chips'] else 0, 
@@ -167,31 +191,46 @@ if st.session_state.stock_memory:
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([2, 2, 3, 2])
             
+            # 1. 基本面
             with c1:
                 st.subheader(f"{d['name']}")
                 st.caption(f"{sid}.TW")
                 if d['twse']:
                     st.write(f"PE: {d['twse']['pe']} | 殖利率: {d['twse']['yield']}%")
+                if d['market'] and d['market']['mkt_cap'] > 0:
+                     st.caption(f"市值: {d['market']['mkt_cap']:.1f}億")
 
+            # 2. 技術指標數據
             with c2:
                 if d['market']:
-                    st.metric("股價", f"{d['market']['price']}", f"{d['market']['change']:.2f}%")
+                    m = d['market']
+                    st.metric("股價", f"{m['price']}", f"{m['change']:.2f}%")
+                    st.caption(f"量比: {m['v_ratio']:.2f} | 換手: {m['turnover']:.2f}%")
                 else:
                     st.write("-")
 
+            # 3. 法人籌碼 (含連買標籤 + 詳細數據)
             with c3:
                 if d['chips']:
                     streak = d['chips']['streak']
                     net = d['chips']['net']
+                    details = d['chips']['details']
+                    
                     if streak >= 3:
-                        label, color = f"🔥 強力鎖碼 (連買 {streak} 天)", "#FF4B4B"
+                        label, color = f"🔥 連買 {streak} 天", "#FF4B4B"
                     elif streak > 0:
-                        label, color = f"👍 資金流入 (連買 {streak} 天)", "#FFA500"
+                        label, color = f"👍 連買 {streak} 天", "#FFA500"
                     else:
                         label, color = "⚖️ 籌碼觀望", "#808080"
                     
-                    st.markdown(f"<div style='background-color:{color}; padding:10px; border-radius:10px; color:white; text-align:center;'><b>{label}</b><br><small>昨日買超: {net} 張</small></div>", unsafe_allow_html=True)
+                    st.markdown(f"""
+                        <div style='background-color:{color}; padding:8px; border-radius:5px; color:white; text-align:center; margin-bottom:5px;'>
+                        <b>{label}</b> (合計 {net} 張)
+                        </div>
+                        <small style='color:grey'>{details}</small>
+                        """, unsafe_allow_html=True)
 
+            # 4. KD 圖
             with c4:
                 if d['hist'] is not None:
                     with st.popover("📈 KD 技術圖"):
