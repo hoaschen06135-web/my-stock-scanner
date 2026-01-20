@@ -45,10 +45,10 @@ def get_streak(df):
         else: break
     return streak
 
-# --- 3. 證交所 API 模組 (雙引擎: BWIBYK + T86) ---
+# --- 3. 證交所 API 模組 (雙引擎) ---
 @st.cache_data(ttl=3600)
 def fetch_twse_bwibyk():
-    """基本面數據 (PE, Yield)"""
+    """基本面數據"""
     try:
         url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBYK_ALL"
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -59,9 +59,8 @@ def fetch_twse_bwibyk():
 
 @st.cache_data(ttl=3600)
 def fetch_twse_t86():
-    """[新增] 籌碼面備援數據 (T86_ALL) - 保證有數據"""
+    """籌碼面備援數據"""
     try:
-        # 證交所每日三大法人買賣超日報
         url = "https://openapi.twse.com.tw/v1/exchangeReport/T86_ALL"
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         res = requests.get(url, headers=HEADERS, timeout=10, verify=False)
@@ -76,11 +75,9 @@ def sync_all_data(watchlist):
         try: dl.login(token=TOKEN)
         except: pass
     
-    # A. 預先抓取證交所兩大報表 (基本面 + 籌碼備援)
     twse_bwibyk = fetch_twse_bwibyk()
     twse_t86 = fetch_twse_t86()
     
-    # B. Yahoo 股價
     sids_raw = [str(x).split('.')[0].strip() for x in watchlist['股票代號']]
     sids_tw = [f"{s}.TW" for s in sids_raw]
     
@@ -93,15 +90,9 @@ def sync_all_data(watchlist):
 
     for i, (sid, sid_full) in enumerate(zip(sids_raw, sids_tw)):
         name = watchlist.iloc[i]['名稱']
-        report = {
-            "name": name, 
-            "market": None, 
-            "chips": None, 
-            "twse": None, 
-            "hist": None
-        }
+        report = {"name": name, "market": None, "chips": None, "twse": None, "hist": None}
         
-        # 1. Yahoo: 價格/量/KD/市值
+        # 1. Yahoo 數據
         try:
             if not all_hist.empty:
                 if len(sids_tw) > 1:
@@ -131,15 +122,15 @@ def sync_all_data(watchlist):
                     report["hist"] = calculate_kdj(hist)
         except: pass
 
-        # 2. 證交所: PE/Yield
+        # 2. 證交所基本面
         if sid in twse_bwibyk.index:
             s = twse_bwibyk.loc[sid]
             report["twse"] = {"pe": s.get('PEratio', '-'), "yield": s.get('DividendYield', '-')}
 
-        # 3. 籌碼數據 (雙重保險邏輯)
+        # 3. 籌碼數據 (修復版)
         chips_found = False
         
-        # [優先] 嘗試 FinMind (為了計算連買天數)
+        # [FinMind]
         try:
             time.sleep(random.uniform(0.5, 1.2))
             raw_res = dl.get_data(
@@ -165,22 +156,23 @@ def sync_all_data(watchlist):
                 chips_found = True
         except: pass
         
-        # [備援] 如果 FinMind 失敗，改用證交所 T86 (保證有數據)
+        # [證交所備援 T86] (修復逗號問題)
         if not chips_found and sid in twse_t86.index:
             try:
                 t86 = twse_t86.loc[sid]
-                # 證交所單位是股，需除以 1000 換算張
-                # 欄位：ForeignInvestorNetBuySell, InvestmentTrustNetBuySell, DealerSelfNetBuySell, DealerHedgingNetBuySell
-                f_net = int(t86.get('ForeignInvestorNetBuySell', 0)) // 1000
-                t_net = int(t86.get('InvestmentTrustNetBuySell', 0)) // 1000
-                d_net = (int(t86.get('DealerSelfNetBuySell', 0)) + int(t86.get('DealerHedgingNetBuySell', 0))) // 1000
+                # 關鍵修復：先用 .replace(',', '') 去除千分位逗號，再轉 int
+                f_net = int(str(t86.get('ForeignInvestorNetBuySell', '0')).replace(',', '')) // 1000
+                t_net = int(str(t86.get('InvestmentTrustNetBuySell', '0')).replace(',', '')) // 1000
+                d_self = int(str(t86.get('DealerSelfNetBuySell', '0')).replace(',', ''))
+                d_hedge = int(str(t86.get('DealerHedgingNetBuySell', '0')).replace(',', ''))
+                d_net = (d_self + d_hedge) // 1000
                 
                 total_net = f_net + t_net + d_net
                 details = f"外資:{f_net} | 投信:{t_net} | 自營:{d_net}"
                 
-                # 備援模式無法計算連買，Streak 設為 None
                 report["chips"] = {"streak": None, "net": total_net, "details": details, "source": "TWSE(備援)"}
-            except: pass
+            except Exception as e:
+                print(f"T86 parsing error for {sid}: {e}")
 
         st.session_state.stock_memory[sid] = report
         progress_bar.progress((i + 1) / len(sids_raw))
@@ -192,6 +184,11 @@ st.title("🛡️ 專業級法人鎖碼監控站")
 
 with st.sidebar:
     st.header("控制台")
+    # [新增] 清除快取按鈕，解決舊資料卡住問題
+    if st.button("🧹 清除快取並重整"):
+        st.cache_data.clear()
+        st.rerun()
+
     if st.button("🚀 一鍵同步全清單", use_container_width=True):
         try:
             raw_df = conn.read(ttl=0).dropna(how='all')
@@ -236,7 +233,6 @@ if st.session_state.stock_memory:
                     details = d['chips']['details']
                     source = d['chips'].get('source', '')
                     
-                    # 狀態欄邏輯
                     if streak is not None:
                         if streak >= 3:
                             label, color = f"🔥 連買 {streak} 天", "#FF4B4B"
@@ -245,8 +241,7 @@ if st.session_state.stock_memory:
                         else:
                             label, color = "⚖️ 籌碼觀望", "#808080"
                     else:
-                        # 備援模式 (無法計算連買)
-                        label, color = "📊 當日籌碼", "#4682B4" # 藍色
+                        label, color = "📊 當日籌碼", "#4682B4"
 
                     st.markdown(f"""
                         <div style='background-color:{color}; padding:8px; border-radius:5px; color:white; text-align:center; margin-bottom:5px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);'>
@@ -256,7 +251,7 @@ if st.session_state.stock_memory:
                         """, unsafe_allow_html=True)
                     
                     if source == "TWSE(備援)":
-                        st.caption("⚠️ 使用證交所備援數據 (FinMind連線中斷)")
+                        st.caption("⚠️ 使用證交所備援數據 (FinMind異常)")
                 else:
                     st.info("暫無籌碼數據")
 
