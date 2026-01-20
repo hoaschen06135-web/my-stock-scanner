@@ -1,22 +1,24 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import requests
 from streamlit_gsheets import GSheetsConnection
 from FinMind.data import DataLoader
 from datetime import datetime, timedelta
 import time
 import plotly.graph_objects as go
 
-# --- 1. 初始化與環境設定 ---
-st.set_page_config(layout="wide", page_title="專業關注清單-終極修復版")
+# --- 1. 初始化環境 ---
+st.set_page_config(layout="wide", page_title="法人鎖碼監控站")
 conn = st.connection("gsheets", type=GSheetsConnection)
 TOKEN = st.secrets["FINMIND_TOKEN"]
 
 if 'stock_memory' not in st.session_state:
     st.session_state.stock_memory = {}
 
-# --- 2. 本地引擎：KD 計算 (保證 100% 成功) ---
+# --- 2. 核心計算邏輯 ---
 def calculate_kdj(df):
+    """引擎 A：本地計算 KD (保證 100% 畫出圖表)"""
     try:
         low_9 = df['Low'].rolling(window=9).min()
         high_9 = df['High'].rolling(window=9).max()
@@ -26,127 +28,92 @@ def calculate_kdj(df):
         return df
     except: return None
 
-# --- 3. 數據同步核心 (解決 'data' 報錯與限流) ---
+def get_streak(df):
+    """計算法人連續買超天數 (鎖碼核心)"""
+    if not isinstance(df, pd.DataFrame) or df.empty: return 0
+    # 合計三大法人每日買賣超
+    daily = df.groupby('date').apply(lambda x: (pd.to_numeric(x['buy']).sum() - pd.to_numeric(x['sell']).sum())).sort_index(ascending=False)
+    streak = 0
+    for val in daily:
+        if val > 0: streak += 1
+        else: break
+    return streak
+
+# --- 3. 引擎 B：證交所 OpenAPI ---
+@st.cache_data(ttl=3600)
+def fetch_twse_data():
+    """直連證交所 JSON API (避開 Yahoo 限流)"""
+    try:
+        url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBYK_ALL"
+        res = requests.get(url, timeout=10)
+        return pd.DataFrame(res.json()).set_index('Code')
+    except: return pd.DataFrame()
+
+# --- 4. 同步與抓取 ---
 def sync_all_data(watchlist):
     dl = DataLoader()
-    try:
-        dl.login(token=TOKEN)
+    try: dl.login(token=TOKEN)
     except: pass
-    
+    twse_stats = fetch_twse_data()
+
     for _, row in watchlist.iterrows():
         sid = str(row['股票代號']).split('.')[0].strip()
         sid_tw = f"{sid}.TW"
-        report = {"name": row['名稱'], "market": None, "chips": None, "err_y": None, "err_f": None, "hist": None}
+        report = {"name": row['名稱'], "market": None, "chips": None, "twse": None, "hist": None}
         
-        # --- 引擎 A: Yahoo Finance (今日行情 + 本地 KD) ---
+        # Yahoo 引擎：價格與 KD
         try:
             tk = yf.Ticker(sid_tw)
             hist = tk.history(period='3mo')
-            if hist.empty:
-                report["err_y"] = "Yahoo 目前限流 (Rate Limited)"
-            else:
+            if not hist.empty:
                 last_p = round(hist['Close'].iloc[-1], 2)
                 chg = ((last_p - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100
-                v_ratio = hist['Volume'].iloc[-1] / hist['Volume'].iloc[-6:-1].mean()
-                
-                # 計算 KD 線
+                report["market"] = {"price": last_p, "change": chg}
                 report["hist"] = calculate_kdj(hist)
-                
-                # 抓取總股數 (加入 2 秒停頓降壓)
-                time.sleep(2)
-                try:
-                    shares = tk.info.get('sharesOutstanding', 0)
-                except: shares = 0
-                
-                turnover = (hist['Volume'].iloc[-1] / shares) * 100 if shares > 0 else 0
-                report["market"] = {"price": last_p, "change": chg, "v_ratio": v_ratio, "turnover": turnover}
-        except Exception as e: report["err_y"] = str(e)
+        except: pass
 
-        # --- 引擎 B: FinMind (增加防彈檢查，解決 'data' 錯誤) ---
+        # 證交所引擎：本益比/殖利率
+        if sid in twse_stats.index:
+            s = twse_stats.loc[sid]
+            report["twse"] = {"pe": s.get('PEratio', '-'), "yield": s.get('DividendYield', '-')}
+
+        # FinMind 引擎：鎖碼連買計算
         try:
-            time.sleep(1) # 保護延遲
-            # 針對 'data' 錯誤的關鍵修復：不直接 index，先檢查型別
-            raw_res = dl.get_data(
-                dataset="TaiwanStockInstitutionalInvestors", 
-                data_id=sid, 
-                start_date=(datetime.now() - timedelta(14)).strftime('%Y-%m-%d')
-            )
-            
-            # 判斷是否為 DataFrame，防止 KeyError: 'data'
+            time.sleep(0.5) # 防止 Token 被鎖
+            raw_res = dl.get_data(dataset="TaiwanStockInstitutionalInvestors", data_id=sid, start_date=(datetime.now() - timedelta(30)).strftime('%Y-%m-%d'))
             if isinstance(raw_res, pd.DataFrame) and not raw_res.empty:
-                last_d = raw_res['date'].max()
-                td = raw_res[raw_res['date'] == last_d]
-                mapping = {"外資": ["Foreign_Investor"], "投信": ["Investment_Trust"], "自營": ["Dealer_self"]}
-                n_total = 0; det = []
-                for label, kw in mapping.items():
-                    r = td[td['name'].isin(kw)]
-                    if not r.empty:
-                        n = int((pd.to_numeric(r['buy']).sum() - pd.to_numeric(r['sell']).sum()) // 1000)
-                        n_total += n; det.append(f"{label}:{n}張")
-                report["chips"] = {"date": last_d, "total": n_total, "details": " | ".join(det)}
-            else:
-                # 取得伺服器回傳的真實錯誤訊息
-                msg = raw_res.get('msg', '未知錯誤') if isinstance(raw_res, dict) else "數據未更新"
-                report["err_f"] = f"FinMind 暫無數據 ({msg})"
-        except Exception as ef:
-            report["err_f"] = f"連線故障: {str(ef)}"
+                report["chips"] = {"streak": get_streak(raw_res), "net": int((pd.to_numeric(raw_res[raw_res['date']==raw_res['date'].max()]['buy']).sum() - pd.to_numeric(raw_res[raw_res['date']==raw_res['date'].max()]['sell']).sum()) // 1000)}
+        except: pass
         
         st.session_state.stock_memory[sid] = report
 
-# --- 4. 側邊欄控制 ---
+# --- 5. UI 呈現 ---
+st.title("🛡️ 專業級法人鎖碼監控站")
 with st.sidebar:
-    st.header("⚙️ 控制面板")
-    if st.button("🔄 同步雲端清單", use_container_width=True):
-        st.cache_data.clear(); st.rerun()
-
-    try:
-        raw_list = conn.read(ttl=600).dropna(how='all')
-        watchlist = raw_list.iloc[:, :2].copy()
+    if st.button("🚀 一鍵同步全清單", use_container_width=True):
+        raw_df = conn.read(ttl=0).dropna(how='all')
+        watchlist = raw_df.iloc[:, :2].copy()
         watchlist.columns = ["股票代號", "名稱"]
-    except: st.stop()
+        sync_all_data(watchlist)
+        st.rerun()
 
-    if st.button("🚀 一鍵同步所有數據指標", use_container_width=True):
-        with st.spinner("同步中..."):
-            sync_all_data(watchlist)
-            st.rerun()
-
-    if st.button("🧹 清除畫面數據", use_container_width=True):
-        st.session_state.stock_memory = {}; st.rerun()
-
-# --- 5. 主畫面呈現 ---
-st.title("🚀 專業關注清單監控")
-
-for _, row in watchlist.iterrows():
-    sid = str(row['股票代號']).split('.')[0].strip()
-    with st.container(border=True):
-        col_title, col_kd = st.columns([7, 3])
-        if sid in st.session_state.stock_memory:
-            d = st.session_state.stock_memory[sid]
-            with col_title: st.subheader(f"{d['name']} ({sid}.TW)")
-            with col_kd:
-                if d["hist"] is not None:
-                    with st.popover("📈 查看 KD"):
+if st.session_state.stock_memory:
+    for sid, d in st.session_state.stock_memory.items():
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([2, 2, 3, 2])
+            c1.subheader(d['name'])
+            c1.caption(f"{sid}.TW")
+            if d['market']:
+                c2.metric("股價", f"{d['market']['price']}", f"{d['market']['change']:.2f}%")
+            if d['chips']:
+                streak = d['chips']['streak']
+                label = f"🔥 連買 {streak} 天" if streak >= 3 else (f"👍 連買 {streak} 天" if streak > 0 else "⚖️ 買賣拉鋸")
+                color = "#FF4B4B" if streak >= 3 else ("#FFA500" if streak > 0 else "#808080")
+                c3.markdown(f"<div style='background-color:{color}; padding:10px; border-radius:10px; color:white; text-align:center;'><b>{label}</b><br><small>昨日: {d['chips']['net']} 張</small></div>", unsafe_allow_html=True)
+            with c4:
+                if d['hist'] is not None:
+                    with st.popover("📈 KD圖"):
                         fig = go.Figure()
-                        fig.add_trace(go.Scatter(x=d['hist'].index, y=d['hist']['K'], name='K值'))
-                        fig.add_trace(go.Scatter(x=d['hist'].index, y=d['hist']['D'], name='D值'))
-                        fig.update_layout(height=250, margin=dict(l=5, r=5, t=5, b=5))
+                        fig.add_trace(go.Scatter(x=d['hist'].index, y=d['hist']['K'], name='K'))
+                        fig.add_trace(go.Scatter(x=d['hist'].index, y=d['hist']['D'], name='D'))
                         st.plotly_chart(fig, use_container_width=True)
-            
-            # 報錯警告
-            if d["err_y"]: st.error(f"⚠️ 行情故障: {d['err_y']}")
-            if d["err_f"]: st.warning(f"⚠️ 籌碼故障: {d['err_f']}")
-
-            if d["market"]:
-                m = d["market"]; c1, c2, c3 = st.columns(3)
-                c1.metric("現價/漲幅", f"{m['price']}", f"{m['change']:.2f}%")
-                c2.metric("量比", f"{m['v_ratio']:.2f}")
-                # 解決 0.00% 問題：顯示 Yahoo 抓到的真實數據
-                t_val = f"{m['turnover']:.2f}%" if m['turnover'] > 0 else "無法抓取"
-                c3.metric("換手率", t_val)
-            
-            if d["chips"]:
-                c = d["chips"]; t_col = "red" if c['total'] > 0 else "green"
-                st.markdown(f"<div style='background-color:#f0f2f6; padding:10px; border-radius:5px;'>🗓️ {c['date']} | 合計: <span style='color:{t_col}; font-weight:bold;'>{c['total']}張</span><br><small>{c['details']}</small></div>", unsafe_allow_html=True)
-        else:
-            st.subheader(f"{row['名稱']} ({sid}.TW)")
-            st.caption("尚未同步，請點擊一鍵同步。")
